@@ -1,0 +1,11 @@
+{
+  "name": "bee-memory",
+  "version": "0.1.0",
+  "purpose": "三层记忆 + 知识图谱 + 宪法 + 遗忘曲线",
+  "port": 8004,
+  "auth": { "type": "bearer", "env_var": "BEE_BEARER_TOKEN" },
+  "endpoints": [
+    {"method": "GET",  "path": "/healthz"},
+    {"method": "GET",  "path": "/manifest"}
+  ]
+}
