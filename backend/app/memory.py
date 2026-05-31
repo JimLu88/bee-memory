@@ -73,8 +73,33 @@ def store(req: StoreRequest) -> dict:
     return {"memory_id": mid}
 
 
+# v8 记忆种类优先级: 亲历的流程/情景决策 > 书本理论.
+# 用户直觉: "情景决策与流程的记忆高于书本; 书本重要度没这个高".
+# 数值越大越优先; 在激活打分里作为一个加权项, 让经验类记忆压过纯书本知识.
+_KIND_PRIORITY: dict[str, float] = {
+    "procedural":        1.00,   # 流程/方法 (怎么做) — 最高
+    "episodic":          0.90,   # 亲历的决策/对话
+    "self_upgrade":      0.85,
+    "knowledge_case":    0.70,   # 真实案例 ≈ 准经验
+    "knowledge_pitfall": 0.65,   # 踩过的坑
+    "knowledge_standard":0.60,   # 法规/标准
+    "semantic":          0.55,
+    "knowledge_kol":     0.48,
+    "knowledge_book":    0.45,   # 书本理论 — 低于一切亲历经验
+    "knowledge_trend":   0.42,
+    "knowledge_history": 0.40,
+    "knowledge_slang":   0.35,
+}
+
+
 def _activation_score(row: dict, now: int) -> float:
-    """v3-D 6 因子打分."""
+    """v3-D 6 因子打分 + v8 记忆种类权重.
+
+    遗忘曲线: recency (14d 半衰期) + age_penalty 让久未调用的记忆自然沉底;
+    importance 由写入方分级 (核心书=5 慢沉, 普通/边角书=3 快沉), 被专门召回时
+    last_recall_ts 刷新 → recency 重置 = "重新激活". 这正是用户要的"书也会遗忘,
+    除非特别调用才重新激活".
+    """
     age_days = max(0, (now - row["created_ts"]) / 86400.0)
     recency_days = max(0, (now - row.get("last_recall_ts", row["created_ts"])) / 86400.0)
     recency = math.exp(-recency_days / 14.0)              # half-life 14d
@@ -85,8 +110,10 @@ def _activation_score(row: dict, now: int) -> float:
     predictive = row.get("predictive_value", 0)
     age_penalty = age_days / 365.0
     importance_boost = row.get("importance", 2) / 5.0
+    kind_priority = _KIND_PRIORITY.get(row.get("kind") or "", 0.40)
     return (1.0 * recency + 0.6 * frequency + 0.8 * emotional + 0.5 * novelty
-            + 0.7 * connection + 0.6 * predictive - 0.3 * age_penalty + 0.5 * importance_boost)
+            + 0.7 * connection + 0.6 * predictive - 0.3 * age_penalty
+            + 0.5 * importance_boost + 1.0 * kind_priority)
 
 
 def _spread_activation(seed_ids: list[str], hops: int = 2, decay: float = 0.7) -> dict[str, float]:
