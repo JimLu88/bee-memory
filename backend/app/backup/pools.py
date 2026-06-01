@@ -323,9 +323,9 @@ class GiteePool:
                 inner = data.get("content") if isinstance(data, dict) else None
                 if not inner:
                     return None
-                # 码云返回的 content 是"文件字节"的 base64, 文件字节本身又是 base64(密文)
-                file_bytes = base64.b64decode(inner)
-                return base64.b64decode(file_bytes)
+                # 码云 PUT 时 content=base64(分片), 码云解码后把"分片"存为文件;
+                # GET 返回 content=base64(文件)=base64(分片) → 解一次即得原始分片.
+                return base64.b64decode(inner)
         except Exception:
             return None
 
