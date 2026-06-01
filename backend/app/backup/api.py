@@ -53,10 +53,11 @@ class PoolConfigBody(BaseModel):
     GITEE_OWNER: str = ""
     GITEE_REPO: str = ""
     GITEE_BRANCH: str = ""
-    # Google Drive (服务账号 JSON 整张 / 或短期 OAuth token)
-    GOOGLE_DRIVE_SA_JSON: str = ""
-    GOOGLE_DRIVE_TOKEN: str = ""
-    GOOGLE_DRIVE_FOLDER: str = ""
+    # GitLab 私有仓库 (替代 Google Drive — 个人 Google 账号服务账号传不了)
+    GITLAB_TOKEN: str = ""
+    GITLAB_PROJECT: str = ""
+    GITLAB_BRANCH: str = ""
+    GITLAB_HOST: str = ""
 
 
 @router.get("/config")

@@ -1,4 +1,4 @@
-"""v3-E 5 池适配器 — GitHub Gist / 坚果云 WebDAV / Notion / Gitee 码云 / Google Drive.
+"""v3-E 5 池适配器 — GitHub Gist / 坚果云 WebDAV / Notion / Gitee 码云 / GitLab.
 
 每池支持多账号轮换 (env 列表配置)。未配 API key 时降级本地缓存 + 标 pending,
 后台 retry 队列稍后上传 — 用户体验:写入立即返回,云端慢慢同步.
@@ -334,116 +334,89 @@ class GiteePool:
                 "note": "" if self._ok() else "需配 GITEE_TOKEN/OWNER/REPO (私有仓库)"}
 
 
-class GDrivePool:
-    """Google Drive. 国内需梯子. 支持两种凭证:
-    1) GOOGLE_DRIVE_SA_JSON = 服务账号 JSON 整张 (推荐, 贴一次即可, 代码自动签 JWT 换 token).
-       ⚠ 服务账号本身没有 My Drive 配额, 必须把 GOOGLE_DRIVE_FOLDER 指向一个
-         "共享云端硬盘(Shared Drive)" 内的文件夹, 或一个已共享给该服务账号邮箱
-         (client_email) 的文件夹, 否则上传会报 storageQuotaExceeded.
-       需要 pip install cryptography (RS256 签名); 未装则该模式不可用.
-    2) GOOGLE_DRIVE_TOKEN = 直接给一个短期 OAuth access token (1 小时过期, 不推荐).
+class GitLabPool:
+    """GitLab 私有仓库 (替代 Google Drive — 个人 Google 账号 + 服务账号传不了).
+
+    和码云/Gist 同套路: 用 GitLab Repository Files API 把加密分片存成仓库文件
+    shards/<id>.b64. gitlab.com 免费无限私有库; 也支持自建 GitLab (改 GITLAB_HOST).
+
+    配置 (前端 BackupConfigPanel 填, 或 env):
+      GITLAB_TOKEN   : Personal Access Token
+                       (gitlab.com → 右上头像 → Preferences → Access Tokens,
+                        勾 api 或 write_repository 权限)
+      GITLAB_PROJECT : 项目 ID(数字, 仓库主页 Settings→General 顶部可见) 或 "用户名/仓库名"
+      GITLAB_BRANCH  : 分支, 默认 main
+      GITLAB_HOST    : 默认 https://gitlab.com (自建实例才改)
     """
-    name = "gdrive"
+    name = "gitlab"
 
     def __init__(self) -> None:
-        self.raw_token = _cfg("GOOGLE_DRIVE_TOKEN", "")
-        self.folder = _cfg("GOOGLE_DRIVE_FOLDER", "")
-        self.sa_json = _cfg("GOOGLE_DRIVE_SA_JSON", "")
-        self._cached_token = ""
-        self._token_exp = 0
+        self.token = _cfg("GITLAB_TOKEN", "").strip()
+        self.project = _cfg("GITLAB_PROJECT", "").strip()
+        self.branch = (_cfg("GITLAB_BRANCH", "main") or "main").strip()
+        host = _cfg("GITLAB_HOST", "https://gitlab.com").strip().rstrip("/")
+        self.host = host or "https://gitlab.com"
 
-    def _sa_access_token(self) -> str:
-        """用服务账号私钥签 JWT, 换 1 小时 access token (带缓存)."""
-        now = int(time.time())
-        if self._cached_token and now < self._token_exp - 60:
-            return self._cached_token
-        try:
-            sa = json.loads(self.sa_json)
-            from cryptography.hazmat.primitives import hashes, serialization
-            from cryptography.hazmat.primitives.asymmetric import padding
-        except Exception:
-            return ""  # JSON 坏 或 没装 cryptography
-        token_uri = sa.get("token_uri") or "https://oauth2.googleapis.com/token"
-        header = _qiniu_b64(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).rstrip("=")
-        claim = _qiniu_b64(json.dumps({
-            "iss": sa.get("client_email", ""),
-            "scope": "https://www.googleapis.com/auth/drive",
-            "aud": token_uri, "iat": now, "exp": now + 3600,
-        }).encode()).rstrip("=")
-        signing_input = f"{header}.{claim}".encode()
-        try:
-            key = serialization.load_pem_private_key(sa["private_key"].encode(), password=None)
-            sig = key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
-        except Exception:
-            return ""
-        assertion = f"{header}.{claim}.{_qiniu_b64(sig).rstrip('=')}"
-        body = ("grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer"
-                f"&assertion={assertion}").encode()
-        req = urlreq.Request(token_uri, data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
-        try:
-            with urlreq.urlopen(req, timeout=15) as r:
-                tok = json.loads(r.read())
-            self._cached_token = tok.get("access_token", "")
-            self._token_exp = now + int(tok.get("expires_in", 3600))
-            return self._cached_token
-        except Exception:
-            return ""
+    def _ok(self) -> bool:
+        return bool(self.token and self.project)
 
-    def _token(self) -> str:
-        if self.sa_json:
-            return self._sa_access_token()
-        return self.raw_token
+    def _file_url(self, path: str, *, raw: bool = False) -> str:
+        from urllib.parse import quote
+        proj = quote(self.project, safe="")
+        fp = quote(path, safe="")  # 含 / 一起编码成 %2F
+        tail = "/raw" if raw else ""
+        return f"{self.host}/api/v4/projects/{proj}/repository/files/{fp}{tail}"
 
     def put(self, shard_id: str, blob: bytes) -> dict:
-        token = self._token()
-        if not token:
+        if not self._ok():
             return _local_put(self.name, shard_id, blob)
-        metadata = json.dumps({"name": f"{shard_id}.bin",
-                               "parents": [self.folder] if self.folder else []}).encode()
-        boundary = "bee_boundary"
-        body = (
-            f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode()
-            + metadata
-            + f"\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n".encode()
-            + blob
-            + f"\r\n--{boundary}--".encode()
-        )
-        req = urlreq.Request(
-            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true",
-            data=body,
-            headers={"Authorization": f"Bearer {token}",
-                     "Content-Type": f"multipart/related; boundary={boundary}"},
-            method="POST",
-        )
-        try:
-            with urlreq.urlopen(req, timeout=15) as r:
-                fid = json.loads(r.read())["id"]
-                return {"remote_ref": fid, "account_id": "gdrive", "pending_upload": False}
-        except (urlerr.URLError, KeyError):
-            return _local_put(self.name, shard_id, blob)
+        path = f"shards/{shard_id}.b64"
+        payload = json.dumps({
+            "branch": self.branch,
+            "content": base64.b64encode(blob).decode("ascii"),
+            "encoding": "base64",
+            "commit_message": f"bee-memory shard {shard_id}",
+        }).encode()
+        hdr = {"PRIVATE-TOKEN": self.token, "Content-Type": "application/json"}
+        # 先试创建(POST); 文件已存在(400)则改更新(PUT)
+        for method in ("POST", "PUT"):
+            req = urlreq.Request(self._file_url(path), data=payload, headers=hdr, method=method)
+            try:
+                with urlreq.urlopen(req, timeout=30) as r:
+                    if r.status in (200, 201):
+                        return {"remote_ref": path,
+                                "account_id": hashlib.sha1(self.token.encode()).hexdigest()[:8],
+                                "pending_upload": False}
+            except urlerr.HTTPError as e:
+                if e.code == 400 and method == "POST":
+                    continue  # 已存在 → 走 PUT 更新
+                break
+            except Exception:
+                break
+        return _local_put(self.name, shard_id, blob)
 
     def get(self, remote_ref: str) -> bytes | None:
-        if "/" in remote_ref or "\\" in remote_ref:
-            return _local_get(remote_ref)
-        token = self._token()
-        if not token:
+        # 本地缓存 ref: Windows 绝对路径 (含 "\\" 或盘符 ":")
+        if "\\" in remote_ref or ":" in remote_ref:
+            local = _local_get(remote_ref)
+            if local is not None:
+                return local
+        if not self._ok():
             return None
-        req = urlreq.Request(
-            f"https://www.googleapis.com/drive/v3/files/{remote_ref}?alt=media&supportsAllDrives=true",
-            headers={"Authorization": f"Bearer {token}"})
+        url = self._file_url(remote_ref, raw=True) + f"?ref={self.branch}"
+        req = urlreq.Request(url, headers={"PRIVATE-TOKEN": self.token})
         try:
-            with urlreq.urlopen(req, timeout=15) as r:
-                return r.read()
-        except urlerr.URLError:
+            with urlreq.urlopen(req, timeout=30) as r:
+                return r.read()  # /raw 直接返回原始分片字节
+        except Exception:
             return None
 
     def quota(self) -> dict:
-        return {"configured": bool(self.sa_json or self.raw_token),
-                "note": "服务账号需把目标文件夹共享给 client_email" if self.sa_json else ""}
+        return {"configured": self._ok(),
+                "note": "" if self._ok() else "需配 GITLAB_TOKEN + GITLAB_PROJECT(ID 或 user/repo)"}
 
 
-ALL_POOLS: list[PoolAdapter] = [GistPool(), WebDAVPool(), NotionPool(), GiteePool(), GDrivePool()]
+ALL_POOLS: list[PoolAdapter] = [GistPool(), WebDAVPool(), NotionPool(), GiteePool(), GitLabPool()]
 
 
 def by_name(name: str) -> PoolAdapter:
