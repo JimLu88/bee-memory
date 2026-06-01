@@ -48,12 +48,11 @@ class PoolConfigBody(BaseModel):
     # Notion
     NOTION_TOKEN: str = ""
     NOTION_DATABASE_ID: str = ""
-    # 七牛云 Kodo
-    QINIU_AK: str = ""
-    QINIU_SK: str = ""
-    QINIU_BUCKET: str = ""
-    QINIU_DOMAIN: str = ""
-    QINIU_REGION: str = ""
+    # Gitee 码云私有仓库 (替代七牛, 长期免费无 30 天限制)
+    GITEE_TOKEN: str = ""
+    GITEE_OWNER: str = ""
+    GITEE_REPO: str = ""
+    GITEE_BRANCH: str = ""
     # Google Drive (服务账号 JSON 整张 / 或短期 OAuth token)
     GOOGLE_DRIVE_SA_JSON: str = ""
     GOOGLE_DRIVE_TOKEN: str = ""

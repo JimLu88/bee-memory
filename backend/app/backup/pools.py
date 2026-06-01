@@ -1,11 +1,12 @@
-"""v3-E 5 池适配器 — GitHub Gist / 坚果云 WebDAV / Notion / 七牛云 Kodo / Google Drive.
+"""v3-E 5 池适配器 — GitHub Gist / 坚果云 WebDAV / Notion / Gitee 码云 / Google Drive.
 
 每池支持多账号轮换 (env 列表配置)。未配 API key 时降级本地缓存 + 标 pending,
 后台 retry 队列稍后上传 — 用户体验:写入立即返回,云端慢慢同步.
 
 v6-O: pool_config.json (前端 BackupConfigPanel 写) 优先于 env, 实现"前端配 Key"闭环.
 v8-CN: 去掉 Cloudflare R2 (国内连不上) 和假的阿里云盘池 (从没真上传),
-       换成国内直连的 坚果云 WebDAV + 七牛云 Kodo; Google Drive 支持服务账号 JSON.
+       换成国内直连的 坚果云 WebDAV; Google Drive 支持服务账号 JSON.
+v9-CN: 七牛云 Kodo 只有 30 天免费 → 换成 Gitee 码云私有仓库 (长期免费、国内直连、无期限).
 """
 from __future__ import annotations
 
@@ -235,91 +236,102 @@ def _qiniu_b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-class QiniuPool:
-    """七牛云 Kodo 对象存储. 国内直连, 标准存储 10GB 免费.
+class GiteePool:
+    """Gitee 码云 私有仓库. 国内直连、长期免费、无 30 天限制 (替代七牛).
 
-    需要: QINIU_AK / QINIU_SK (个人中心 → 密钥管理), QINIU_BUCKET (存储空间名),
-    QINIU_DOMAIN (空间绑定的下载域名, 形如 http://xxx.bkt.clouddn.com 或自有域名 —
-    私有空间下载必须靠它), QINIU_REGION (区域上传域名后缀, 默认 z0=华东).
-    上传 token 用 HMAC-SHA1 签名 (stdlib, 无需第三方库).
+    原理: 和 GitHub Gist 池同套路, 但用码云私有仓库的"文件内容 API"存加密分片.
+    每个分片存成仓库里一个文件 shards/<shard_id>.b64 (内容 = base64(分片密文)).
+
+    配置 (前端 BackupConfigPanel 填, 或 env):
+      GITEE_TOKEN  : 私人令牌 (码云 → 设置 → 私人令牌, 勾 projects 权限)
+      GITEE_OWNER  : 你的码云用户名 (个人空间地址里的那个, 形如 zhangsan)
+      GITEE_REPO   : 一个【私有】仓库名 (先在码云手动建一个空私有仓库, 如 bee-backup)
+      GITEE_BRANCH : 分支, 默认 master
     """
-    name = "qiniu"
-
-    _REGION_HOST = {
-        "z0": "https://up-z0.qiniup.com", "z1": "https://up-z1.qiniup.com",
-        "z2": "https://up-z2.qiniup.com", "na0": "https://up-na0.qiniup.com",
-        "as0": "https://up-as0.qiniup.com",
-    }
+    name = "gitee"
+    _API = "https://gitee.com/api/v5"
 
     def __init__(self) -> None:
-        self.ak = _cfg("QINIU_AK", "")
-        self.sk = _cfg("QINIU_SK", "")
-        self.bucket = _cfg("QINIU_BUCKET", "")
-        dom = _cfg("QINIU_DOMAIN", "").strip().rstrip("/")
-        if dom and not dom.startswith("http"):
-            dom = "http://" + dom
-        self.domain = dom
-        self.region = (_cfg("QINIU_REGION", "z0") or "z0").strip()
+        self.token = _cfg("GITEE_TOKEN", "").strip()
+        self.owner = _cfg("GITEE_OWNER", "").strip()
+        self.repo = _cfg("GITEE_REPO", "").strip()
+        self.branch = (_cfg("GITEE_BRANCH", "master") or "master").strip()
 
     def _ok(self) -> bool:
-        return bool(self.ak and self.sk and self.bucket)
+        return bool(self.token and self.owner and self.repo)
 
-    def _upload_token(self, key: str) -> str:
-        deadline = int(time.time()) + 3600
-        policy = json.dumps({"scope": f"{self.bucket}:{key}", "deadline": deadline},
-                            ensure_ascii=False).encode("utf-8")
-        encoded = _qiniu_b64(policy)
-        sign = hmac.new(self.sk.encode(), encoded.encode(), hashlib.sha1).digest()
-        return f"{self.ak}:{_qiniu_b64(sign)}:{encoded}"
+    def _path(self, shard_id: str) -> str:
+        return f"shards/{shard_id}.b64"
+
+    def _contents_url(self, path: str) -> str:
+        return f"{self._API}/repos/{self.owner}/{self.repo}/contents/{path}"
+
+    def _get_sha(self, path: str) -> str | None:
+        """文件已存在则返回其 sha (更新需要), 不存在返回 None."""
+        url = f"{self._contents_url(path)}?access_token={self.token}&ref={self.branch}"
+        try:
+            with urlreq.urlopen(url, timeout=15) as r:
+                data = json.loads(r.read())
+                return data.get("sha") if isinstance(data, dict) else None
+        except Exception:
+            return None
 
     def put(self, shard_id: str, blob: bytes) -> dict:
         if not self._ok():
             return _local_put(self.name, shard_id, blob)
-        key = f"shards/{shard_id}.bin"
-        token = self._upload_token(key)
-        boundary = "----beeqiniu" + hashlib.md5(key.encode()).hexdigest()[:12]
-        parts: list[bytes] = []
-        for field, val in (("key", key), ("token", token)):
-            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{val}\r\n".encode())
-        parts.append(
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{shard_id}.bin\"\r\n"
-            f"Content-Type: application/octet-stream\r\n\r\n".encode()
-            + blob + b"\r\n"
+        path = self._path(shard_id)
+        content_b64 = base64.b64encode(blob).decode("ascii")
+        sha = self._get_sha(path)  # 有则走更新 (PUT), 无则新建 (POST)
+        payload: dict = {
+            "access_token": self.token,
+            "content": content_b64,
+            "message": f"bee-memory shard {shard_id}",
+            "branch": self.branch,
+        }
+        method = "POST"
+        if sha:
+            payload["sha"] = sha
+            method = "PUT"
+        req = urlreq.Request(
+            self._contents_url(path),
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json;charset=UTF-8"},
+            method=method,
         )
-        parts.append(f"--{boundary}--\r\n".encode())
-        body = b"".join(parts)
-        host = self._REGION_HOST.get(self.region, self._REGION_HOST["z0"])
-        req = urlreq.Request(host, data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST")
         try:
             with urlreq.urlopen(req, timeout=30) as r:
-                data = json.loads(r.read())
-                if data.get("key"):
-                    return {"remote_ref": data["key"], "account_id": self.ak[:8], "pending_upload": False}
+                if r.status in (200, 201):
+                    return {"remote_ref": path,
+                            "account_id": hashlib.sha1(self.token.encode()).hexdigest()[:8],
+                            "pending_upload": False}
         except Exception:
             pass
         return _local_put(self.name, shard_id, blob)
 
     def get(self, remote_ref: str) -> bytes | None:
-        if "\\" in remote_ref or ":" in remote_ref or remote_ref.endswith(".bin") and "/" in remote_ref and not remote_ref.startswith("shards/"):
+        # 本地缓存 ref: Windows 绝对路径 (含 "\\" 或盘符 ":")
+        if "\\" in remote_ref or ":" in remote_ref:
             local = _local_get(remote_ref)
             if local is not None:
                 return local
-        if not (self._ok() and self.domain):
+        if not self._ok():
             return None
-        deadline = int(time.time()) + 3600
-        base = f"{self.domain}/{remote_ref}?e={deadline}"
-        sign = hmac.new(self.sk.encode(), base.encode(), hashlib.sha1).digest()
-        url = f"{base}&token={self.ak}:{_qiniu_b64(sign)}"
+        url = f"{self._contents_url(remote_ref)}?access_token={self.token}&ref={self.branch}"
         try:
             with urlreq.urlopen(url, timeout=30) as r:
-                return r.read()
+                data = json.loads(r.read())
+                inner = data.get("content") if isinstance(data, dict) else None
+                if not inner:
+                    return None
+                # 码云返回的 content 是"文件字节"的 base64, 文件字节本身又是 base64(密文)
+                file_bytes = base64.b64decode(inner)
+                return base64.b64decode(file_bytes)
         except Exception:
             return None
 
     def quota(self) -> dict:
         return {"configured": self._ok(),
-                "note": "" if self.domain else "未配 QINIU_DOMAIN: 能上传但恢复需绑定下载域名"}
+                "note": "" if self._ok() else "需配 GITEE_TOKEN/OWNER/REPO (私有仓库)"}
 
 
 class GDrivePool:
@@ -431,7 +443,7 @@ class GDrivePool:
                 "note": "服务账号需把目标文件夹共享给 client_email" if self.sa_json else ""}
 
 
-ALL_POOLS: list[PoolAdapter] = [GistPool(), WebDAVPool(), NotionPool(), QiniuPool(), GDrivePool()]
+ALL_POOLS: list[PoolAdapter] = [GistPool(), WebDAVPool(), NotionPool(), GiteePool(), GDrivePool()]
 
 
 def by_name(name: str) -> PoolAdapter:
