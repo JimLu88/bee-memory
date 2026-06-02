@@ -15,6 +15,9 @@ backend/data/*.sqlite
 backend/data/*.db
 backend/data/outputs/
 backend/data/scraped/
+# 5 池备份 Key 等敏感配置 — 绝不入库 (仓库已公开, 防 Token 泄露)
+backend/data/pool_config.json
+backend/data/*.json
 
 # Build artifacts
 build/
