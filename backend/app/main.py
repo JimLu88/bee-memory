@@ -20,6 +20,25 @@ BEARER_TOKEN = os.environ.get("BEE_BEARER_TOKEN", "dev-token-change-me")
 app = FastAPI(title=SERVICE_NAME, version="0.1.0")
 bearer = HTTPBearer(auto_error=False)
 
+# v4 安全: 默认 token 大声告警 (本地默认可用, 上公网前务必改 BEE_BEARER_TOKEN)
+if BEARER_TOKEN == "dev-token-change-me":
+    import logging as _lg
+    _lg.getLogger("bee.security").warning(
+        "[bee-memory] 正在使用默认 Bearer token; 仅限本地回环. 对外暴露前请设 BEE_BEARER_TOKEN.")
+
+# v4 安全(可选): 严格 Host 白名单, 防 DNS-rebinding. 默认关 (不影响 LAN/NAS 访问).
+if os.environ.get("BEE_STRICT_HOST") == "1":
+    _ALLOWED = {"127.0.0.1", "localhost", "::1"} | set(
+        h.strip() for h in os.environ.get("BEE_ALLOWED_HOSTS", "").split(",") if h.strip())
+
+    @app.middleware("http")
+    async def _host_guard(request, call_next):
+        from starlette.responses import JSONResponse
+        host = (request.headers.get("host") or "").split(":")[0]
+        if host and host not in _ALLOWED:
+            return JSONResponse({"detail": "host not allowed"}, status_code=421)
+        return await call_next(request)
+
 # v3-I OpenTelemetry + /metrics (silent fallback if deps missing)
 import sys as _sys  # noqa: E402
 _sys.path.insert(0, "D:/AI/observability")
@@ -67,10 +86,14 @@ def manifest() -> dict:
 from .memory import router as service_router  # noqa: E402
 from .spaced_repetition import router as sr_router  # noqa: E402
 from .backup import router as backup_router  # noqa: E402
+from .associative import router as assoc_router  # noqa: E402  v4 关联层
+from .ui import router as ui_router  # noqa: E402  v4 小白 UI (无鉴权页面)
 
 app.include_router(service_router, prefix="/memory", dependencies=[Depends(auth)])
 app.include_router(sr_router, prefix="/memory", dependencies=[Depends(auth)])
 app.include_router(backup_router, prefix="/memory/backup", dependencies=[Depends(auth)])
+app.include_router(assoc_router, prefix="/memory", dependencies=[Depends(auth)])
+app.include_router(ui_router)  # /ui 与 / (页面不鉴权, JS 调 API 时带 token)
 
 if _log_router_ok:
     app.include_router(log_router, dependencies=[Depends(auth)])

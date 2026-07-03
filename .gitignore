@@ -19,6 +19,10 @@ backend/data/scraped/
 backend/data/pool_config.json
 backend/data/*.json
 
+# v4 生成物: 备份快照 / Obsidian vault 渲染 (可从 DB 重建, 不入库)
+backups/
+vault/
+
 # Build artifacts
 build/
 dist/

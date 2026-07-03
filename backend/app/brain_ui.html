@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🧠 我的记忆大脑</title>
+<style>
+  :root{
+    --bg:#f6f8fc; --card:#fff; --ink:#1a2230; --sub:#5b6b7c;
+    --brand:#2563eb; --brand-soft:#e8f0fe; --line:#e6eaf2;
+    --ok:#16a34a; --warn:#d97706; --sem:#7c3aed; --lit:#0891b2; --spread:#db2777;
+    --shadow:0 1px 3px rgba(20,30,60,.06),0 6px 20px rgba(20,30,60,.06);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6}
+  .wrap{max-width:900px;margin:0 auto;padding:16px}
+  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:8px 0 4px}
+  header h1{font-size:22px;margin:0}
+  .stats{display:flex;gap:10px;flex-wrap:wrap;margin-left:auto;font-size:13px;color:var(--sub)}
+  .stats b{color:var(--ink)}
+  .pill{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:4px 12px;box-shadow:var(--shadow)}
+  .tabs{display:flex;gap:6px;margin:14px 0;flex-wrap:wrap}
+  .tab{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:8px 18px;
+    cursor:pointer;font-size:15px;color:var(--sub);user-select:none}
+  .tab.on{background:var(--brand);color:#fff;border-color:var(--brand)}
+  .panel{display:none} .panel.on{display:block}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;
+    box-shadow:var(--shadow);margin-bottom:14px}
+  .hint{color:var(--sub);font-size:13px;margin:6px 2px 0}
+  input,textarea,select{width:100%;border:1px solid var(--line);border-radius:12px;padding:12px 14px;
+    font-size:16px;font-family:inherit;background:#fbfcfe;color:var(--ink);outline:none}
+  input:focus,textarea:focus,select:focus{border-color:var(--brand);background:#fff}
+  .bigbox{display:flex;gap:8px}
+  .bigbox input{font-size:17px}
+  button.go{background:var(--brand);color:#fff;border:none;border-radius:12px;padding:0 22px;
+    font-size:16px;cursor:pointer;white-space:nowrap}
+  button.go:active{transform:translateY(1px)}
+  button.ghost{background:var(--brand-soft);color:var(--brand);border:none;border-radius:10px;
+    padding:8px 14px;font-size:14px;cursor:pointer}
+  .seg{display:inline-flex;background:#eef1f7;border-radius:10px;padding:3px;margin-top:10px}
+  .seg span{padding:6px 14px;border-radius:8px;cursor:pointer;font-size:14px;color:var(--sub)}
+  .seg span.on{background:#fff;color:var(--ink);box-shadow:var(--shadow)}
+  .res{border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-top:10px;background:#fff}
+  .res .t{font-weight:600;font-size:15.5px}
+  .res .s{color:var(--sub);font-size:14px;margin-top:3px;white-space:pre-wrap}
+  .badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;align-items:center}
+  .b{font-size:12px;padding:2px 9px;border-radius:999px;color:#fff}
+  .b.sem{background:var(--sem)} .b.lit{background:var(--lit)} .b.spread{background:var(--spread)}
+  .b.imp{background:#f1f5f9;color:var(--sub)} .b.tok{background:#f1f5f9;color:var(--sub)}
+  .full{display:none;margin-top:10px;padding-top:10px;border-top:1px dashed var(--line);
+    white-space:pre-wrap;font-size:14px;color:#2c3444}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .stars{font-size:24px;cursor:pointer;user-select:none;letter-spacing:2px}
+  .stars i{color:#dfe3ec;font-style:normal} .stars i.on{color:#f59e0b}
+  .empty{color:var(--sub);text-align:center;padding:24px}
+  .connector{background:var(--brand-soft);border-radius:12px;padding:12px 14px;margin-top:8px}
+  .spin{display:inline-block;width:16px;height:16px;border:2px solid #cfd6e6;border-top-color:var(--brand);
+    border-radius:50%;animation:sp .7s linear infinite;vertical-align:-3px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .gear{cursor:pointer;font-size:18px;opacity:.6}
+  #settings{margin-top:10px}
+  @media(max-width:560px){.row2{grid-template-columns:1fr}.stats{width:100%;margin:6px 0 0}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🧠 我的记忆大脑</h1>
+    <div class="stats" id="stats"><span class="pill">连接中…</span></div>
+    <span class="gear" id="gear" title="设置">⚙️</span>
+  </header>
+  <div id="settings" class="card" style="display:none">
+    <div class="hint">服务地址与令牌（本地默认即可，一般不用改）</div>
+    <div class="row2" style="margin-top:8px">
+      <input id="base" placeholder="http://127.0.0.1:8004">
+      <input id="token" placeholder="Bearer token">
+    </div>
+    <button class="ghost" style="margin-top:8px" onclick="saveCfg()">保存</button>
+  </div>
+
+  <div class="tabs">
+    <div class="tab on" data-p="search">🔍 检索</div>
+    <div class="tab" data-p="connect">🔗 关联</div>
+    <div class="tab" data-p="add">✍️ 记一条</div>
+    <div class="tab" data-p="review">🔁 复习</div>
+    <div class="tab" data-p="concepts">🗺️ 概念地图</div>
+  </div>
+
+  <div class="panel on" id="p-search">
+    <div class="card">
+      <div class="bigbox">
+        <input id="q" placeholder="问问你的记忆大脑，比如：怎么应对不确定性？" onkeydown="if(event.key==='Enter')doSearch()">
+        <button class="go" onclick="doSearch()">检索</button>
+      </div>
+      <div class="seg" id="mode">
+        <span class="on" data-m="hybrid">智能（懂意思+顺关联）</span>
+        <span data-m="fts">精确（关键词）</span>
+      </div>
+      <div class="hint">💡 智能检索会理解你的意思，并顺着知识网络找到相关的记忆——不只是关键词匹配。</div>
+      <div id="themes" class="hint" style="margin-top:10px"></div>
+    </div>
+    <div id="results"><div class="empty">输入问题开始检索，或点上面的主题快速进入 👆</div></div>
+  </div>
+
+  <div class="panel" id="p-connect">
+    <div class="card">
+      <div class="hint">想知道两件事之间有什么关系？（解决"知道 A、知道 B，却连不起来"）</div>
+      <div class="row2" style="margin-top:10px">
+        <input id="ca" placeholder="第一个，如：时间管理">
+        <input id="cb" placeholder="第二个，如：拖延">
+      </div>
+      <button class="go" style="margin-top:10px;padding:12px 22px" onclick="doConnect()">找关系</button>
+    </div>
+    <div id="connectRes"></div>
+  </div>
+
+  <div class="panel" id="p-add">
+    <div class="card">
+      <div class="hint">📌 记什么？以后还想找到的东西：拍板的决定、踩过的坑、可复用的方法、项目背景。</div>
+      <textarea id="content" rows="4" style="margin-top:10px" placeholder="例：定价口径改成按店铺实收价倒推系数（2026-07 拍板）。相关：[[定价]] [[系数]]"></textarea>
+      <div class="row2" style="margin-top:10px">
+        <select id="kind">
+          <option value="episodic">经历/决策（我做过、定过的）</option>
+          <option value="semantic">知识/事实（是什么）</option>
+          <option value="procedural">流程/方法（怎么做，最优先）</option>
+        </select>
+        <div>
+          <div class="hint" style="margin:0 0 2px">有多重要（越高越不会被遗忘）</div>
+          <div class="stars" id="stars"><i data-v="1">★</i><i data-v="2">★</i><i data-v="3" class="on">★</i><i data-v="4">★</i><i data-v="5">★</i></div>
+        </div>
+      </div>
+      <button class="go" style="margin-top:12px;padding:12px 22px" onclick="doStore()">记住它</button>
+      <span id="addMsg" class="hint"></span>
+    </div>
+  </div>
+
+  <div class="panel" id="p-review">
+    <div class="card">
+      <div class="hint">🔁 到期该回顾的记忆（间隔复习，越难记的越常出现）。</div>
+      <button class="ghost" style="margin-top:8px" onclick="loadReview()">刷新</button>
+    </div>
+    <div id="reviewRes"></div>
+  </div>
+
+  <div class="panel" id="p-concepts">
+    <div class="card">
+      <div class="hint">🗺️ 知识网络里的核心概念（按被提及次数）。这些是你记忆大脑的"节点"。</div>
+      <button class="ghost" style="margin-top:8px" onclick="loadConcepts()">加载</button>
+      <div class="hint" style="margin-top:8px">想图形化浏览整个网络？用 <b>Obsidian</b> 打开 <code>D:\AI\AI 记忆中心\vault</code>。</div>
+    </div>
+    <div id="conceptRes"></div>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+let cfg={base:localStorage.brainBase||'http://127.0.0.1:8004',token:localStorage.brainTok||'dev-token-change-me'};
+let mode='hybrid', importance=3;
+
+function saveCfg(){cfg.base=$('#base').value||cfg.base;cfg.token=$('#token').value||cfg.token;
+  localStorage.brainBase=cfg.base;localStorage.brainTok=cfg.token;$('#settings').style.display='none';loadStats();}
+$('#gear').onclick=()=>{const s=$('#settings');s.style.display=s.style.display==='none'?'block':'none';
+  $('#base').value=cfg.base;$('#token').value=cfg.token;};
+
+async function api(path,opts={}){
+  const r=await fetch(cfg.base+path,{...opts,headers:{'Authorization':'Bearer '+cfg.token,
+    'Content-Type':'application/json',...(opts.headers||{})}});
+  if(!r.ok){const e=new Error('HTTP '+r.status);e.status=r.status;throw e;}
+  return r.json();
+}
+const enc=encodeURIComponent;
+
+$$('.tab').forEach(t=>t.onclick=()=>{$$('.tab').forEach(x=>x.classList.remove('on'));t.classList.add('on');
+  $$('.panel').forEach(p=>p.classList.remove('on'));$('#p-'+t.dataset.p).classList.add('on');});
+$$('#mode span').forEach(s=>s.onclick=()=>{$$('#mode span').forEach(x=>x.classList.remove('on'));
+  s.classList.add('on');mode=s.dataset.m;});
+$$('#stars i').forEach(st=>st.onclick=()=>{importance=+st.dataset.v;
+  $$('#stars i').forEach(x=>x.classList.toggle('on',+x.dataset.v<=importance));});
+
+async function loadStats(){
+  try{const d=await api('/memory/digest?limit=1');const c=d.counts;
+    $('#stats').innerHTML=`<span class="pill"><b>${c.memories}</b> 记忆</span>
+      <span class="pill"><b>${c.edges}</b> 关联</span>
+      <span class="pill"><b>${c.embedded}</b> 已向量化</span>
+      <span class="pill"><b>${c.due_review}</b> 待复习</span>`;
+    const th=$('#themes'); const themes=d.themes||[];
+    if(th&&themes.length){th.innerHTML='🧭 你的知识主题：'+themes.map(t=>
+      `<span style="display:inline-block;margin:3px 4px 0 0;padding:2px 10px;border-radius:999px;background:var(--brand-soft);color:var(--brand);cursor:pointer"
+        onclick="$('#q').value='${esc(t.concept)}';doSearch()">${esc(t.concept)}</span>`).join('');}
+  }catch(e){$('#stats').innerHTML=e.status===401
+    ? '<span class="pill" style="color:#d97706">令牌不正确，点右上角 ⚙️ 修改</span>'
+    : '<span class="pill" style="color:#d97706">服务未连接，请确认 bee-memory:8004 在运行</span>';}
+}
+
+const badge=v=>{const m={'语义':'sem','字面':'lit','关联扩散':'spread'};
+  return (v||'').split('+').map(x=>`<span class="b ${m[x]||'lit'}">${x}</span>`).join('');}
+
+async function doSearch(){
+  const q=$('#q').value.trim();if(!q)return;
+  $('#results').innerHTML='<div class="empty"><span class="spin"></span> 检索中…</div>';
+  try{
+    let items,extra='';
+    if(mode==='hybrid'){const d=await api('/memory/recall-hybrid?query='+enc(q)+'&k=8&compact=1');
+      items=d.items;extra=d.semantic?`（语义理解已开，关联扩散触达 ${d.ppr_reached} 条）`:'';}
+    else{const d=await api('/memory/recall?query='+enc(q)+'&k=8&fts=1');
+      items=(d.items||[]).map(it=>({id:it.id,title:(it.content||'').split('\n')[0].slice(0,40),
+        snippet:(it.content||'').slice(0,90),importance:it.importance,via:'字面',_full:it.content}));}
+    if(!items.length){$('#results').innerHTML='<div class="empty">没有找到相关记忆。换个说法，或先去"记一条"。</div>';return;}
+    $('#results').innerHTML=`<div class="hint" style="margin:0 0 8px">找到 ${items.length} 条 ${extra}</div>`+
+      items.map((it,i)=>`<div class="res">
+        <div class="t">${esc(it.title||'')}</div>
+        <div class="s">${esc(it.snippet||'')}</div>
+        ${it.source?`<div class="hint" style="margin-top:4px">📖 出处：${esc(it.source)}</div>`:''}
+        <div class="badges">${badge(it.via)}
+          <span class="b imp">重要度 ${it.importance??'-'}</span>
+          ${it.token_count?`<span class="b tok">~${it.token_count} tok</span>`:''}
+          <button class="ghost" onclick="showFull(${i},'${it.id}')">看全文</button></div>
+        <div class="full" id="full-${i}">${it._full?esc(it._full):''}</div></div>`).join('');
+    window._items=items;
+  }catch(e){$('#results').innerHTML='<div class="empty">检索失败：'+e.message+'</div>';}
+}
+async function showFull(i,id){
+  const el=$('#full-'+i);if(el.style.display==='block'){el.style.display='none';return;}
+  if(!el.textContent.trim()){el.textContent='加载中…';
+    try{const d=await api('/memory/get?id='+enc(id));el.textContent=d.content||'(空)';}
+    catch(e){el.textContent='加载失败';}}
+  el.style.display='block';
+}
+
+async function doConnect(){
+  const a=$('#ca').value.trim(),b=$('#cb').value.trim();if(!a||!b)return;
+  $('#connectRes').innerHTML='<div class="empty"><span class="spin"></span> 沿知识网络找连接…</div>';
+  try{const d=await api('/memory/connect2?a='+enc(a)+'&b='+enc(b));
+    if(!d.connected){$('#connectRes').innerHTML=`<div class="card empty">「${esc(a)}」和「${esc(b)}」目前在记忆里没有明显关联。</div>`;return;}
+    const how=d.method==='ppr'?'知识图谱多跳连接':'语义桥（两边都相近的记忆）';
+    $('#connectRes').innerHTML=`<div class="card"><div class="hint">通过<b>${how}</b>找到连接者：</div>`+
+      d.connectors.map(c=>`<div class="connector">${esc(c.snippet||'')}<div class="hint" style="margin-top:4px">连接强度 ${c.score}</div></div>`).join('')+`</div>`;
+  }catch(e){$('#connectRes').innerHTML='<div class="empty">查询失败：'+e.message+'</div>';}
+}
+
+async function doStore(){
+  const content=$('#content').value.trim();
+  if(content.length<4){$('#addMsg').textContent='内容太短了，写清楚一点更容易以后找到（至少 4 个字）';return;}
+  $('#addMsg').textContent='保存中…';
+  try{const d=await api('/memory/store',{method:'POST',body:JSON.stringify(
+      {kind:$('#kind').value,content,importance})});
+    $('#addMsg').innerHTML=' ✅ 已记住 (id='+d.memory_id+')';$('#content').value='';loadStats();
+  }catch(e){$('#addMsg').textContent='保存失败：'+e.message;}
+}
+
+async function loadReview(){
+  $('#reviewRes').innerHTML='<div class="empty"><span class="spin"></span> …</div>';
+  try{const d=await api('/memory/review/due?limit=20');
+    if(!d.items.length){$('#reviewRes').innerHTML='<div class="card empty">今天没有到期复习的记忆 🎉</div>';return;}
+    $('#reviewRes').innerHTML=d.items.map(it=>`<div class="res"><div class="s">${esc((it.content||'').slice(0,120))}</div>
+      <div class="badges"><button class="ghost" onclick="grade('${it.id}',2)">没想起</button>
+      <button class="ghost" onclick="grade('${it.id}',4)">想起了</button>
+      <button class="ghost" onclick="grade('${it.id}',5)">很熟</button></div></div>`).join('');
+  }catch(e){$('#reviewRes').innerHTML='<div class="empty">加载失败：'+e.message+'</div>';}
+}
+async function grade(id,g){try{await api('/memory/review/grade',{method:'POST',body:JSON.stringify({memory_id:id,grade:g})});loadReview();loadStats();}catch(e){}}
+
+async function loadConcepts(){
+  $('#conceptRes').innerHTML='<div class="empty"><span class="spin"></span> …</div>';
+  try{const d=await api('/memory/concepts?limit=40&hub=0');
+    $('#conceptRes').innerHTML='<div class="card">'+d.items.map(c=>
+      `<span class="b" style="background:var(--brand-soft);color:var(--brand);margin:3px;display:inline-block;cursor:pointer"
+        onclick="$('#q').value='${esc(c.name)}';$$('.tab')[0].click();doSearch()">${esc(c.name)} · ${c.mention_count}</span>`).join('')+'</div>';
+  }catch(e){$('#conceptRes').innerHTML='<div class="empty">加载失败：'+e.message+'</div>';}
+}
+
+function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+loadStats();
+</script>
+</body>
+</html>

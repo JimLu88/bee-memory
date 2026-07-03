@@ -1,3 +1,7 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 pydantic>=2.8.0
+jieba>=0.42.1   # v4 关联层: 中文分词 (概念抽取). 缺失时 associative 自动降级 regex+2gram
+numpy>=1.26     # v4 语义层: 暴力余弦检索
+scipy>=1.11     # v4: 个性化 PageRank 稀疏矩阵
+mcp>=1.2        # v4 P2: MCP 服务器 (mcp/server.py, 全会话接入); 嵌入走本地 Ollama bge-m3 无需 pip
