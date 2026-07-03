@@ -62,40 +62,47 @@ def backup_memory(memory_id: str) -> dict:
     ciphertext = enc.encrypt(plaintext)
     shards = rs.split_shards(ciphertext)
 
+    # 先全部上传, 收集行; 最后一次性事务里 删旧代+写新代 (幂等).
+    # 否则同一记忆二次备份会留下两代 10 片, restore 取 rows[:5] 混代 → 重建成乱码/失败.
     pending_total = 0
     refs: list[dict] = []
+    new_rows: list[tuple] = []
+    for i, shard in enumerate(shards):
+        pool_name = target_pools[i % len(target_pools)]
+        shard_id = f"sh-{uuid.uuid4().hex[:12]}"
+        result = pl.by_name(pool_name).put(shard_id, shard)
+        sha = hashlib.sha256(shard).hexdigest()
+        new_rows.append((shard_id, memory_id, pool_name, result.get("account_id", ""),
+                         result["remote_ref"], now, sha, 1 if result.get("pending_upload") else 0))
+        refs.append({"shard_id": shard_id, "pool": pool_name,
+                     "pending": bool(result.get("pending_upload"))})
+        if result.get("pending_upload"):
+            pending_total += 1
     with _conn() as c:
-        for i, shard in enumerate(shards):
-            pool_name = target_pools[i % len(target_pools)]
-            shard_id = f"sh-{uuid.uuid4().hex[:12]}"
-            result = pl.by_name(pool_name).put(shard_id, shard)
-            sha = hashlib.sha256(shard).hexdigest()
-            c.execute(
-                """INSERT INTO backup_shards
-                   (shard_id, memory_id, pool_name, account_id, remote_ref, created_ts, sha256, pending_upload)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (shard_id, memory_id, pool_name, result.get("account_id", ""),
-                 result["remote_ref"], now, sha, 1 if result.get("pending_upload") else 0),
-            )
-            refs.append({"shard_id": shard_id, "pool": pool_name,
-                         "pending": bool(result.get("pending_upload"))})
-            if result.get("pending_upload"):
-                pending_total += 1
+        c.execute("DELETE FROM backup_shards WHERE memory_id=?", (memory_id,))  # 清旧代
+        c.executemany(
+            """INSERT INTO backup_shards
+               (shard_id, memory_id, pool_name, account_id, remote_ref, created_ts, sha256, pending_upload)
+               VALUES (?,?,?,?,?,?,?,?)""", new_rows)
     return {"memory_id": memory_id, "shard_count": len(shards),
             "pending": pending_total, "refs": refs, "tier_pools": target_pools}
 
 
 def restore_memory(memory_id: str) -> dict | None:
     with _conn() as c:
+        # 只取最新一代 (created_ts 最大); 防历史遗留的多代分片混入致重建乱码.
+        latest = c.execute(
+            "SELECT MAX(created_ts) FROM backup_shards WHERE memory_id=?", (memory_id,)).fetchone()[0]
+        if latest is None:
+            return None
         rows = c.execute(
-            "SELECT shard_id, pool_name, remote_ref FROM backup_shards WHERE memory_id=? ORDER BY shard_id",
-            (memory_id,),
+            "SELECT shard_id, pool_name, remote_ref FROM backup_shards WHERE memory_id=? AND created_ts=?",
+            (memory_id, latest),
         ).fetchall()
     if not rows:
         return None
-    shards: list[bytes | None] = [None] * 5
-    for i, r in enumerate(rows[:5]):
-        shards[i] = pl.by_name(r["pool_name"]).get(r["remote_ref"])
+    # reassemble 按分片内嵌 index 归位, 列表顺序无所谓; 拉全部 (最多 5) 交给它
+    shards: list[bytes | None] = [pl.by_name(r["pool_name"]).get(r["remote_ref"]) for r in rows[:5]]
     available = sum(1 for s in shards if s is not None)
     if available < 3:
         return {"status": "failed", "available_shards": available, "needed": 3}

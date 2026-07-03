@@ -149,8 +149,11 @@ def _load_matrix(c: sqlite3.Connection) -> tuple[list[str], np.ndarray]:
     ids: list[str] = []
     vecs: list[np.ndarray] = []
     for mid, dim, blob in c.execute("SELECT memory_id, dim, vec FROM memories_vec"):
-        v = _unpack(blob, dim)
-        if v.shape[0] != EMBED_DIM:   # 维度守卫: 混维(换模型/残留/损坏)不进矩阵, 否则 vstack 崩溃拖垮全检索
+        try:
+            v = _unpack(blob, dim)
+        except Exception:
+            continue  # 截断/损坏的 blob 单行跳过, 别让 frombuffer 崩溃拖垮全检索
+        if v.shape[0] != EMBED_DIM:   # 维度守卫: 混维(换模型/残留)不进矩阵, 否则 vstack 崩溃
             continue
         ids.append(mid)
         vecs.append(v)

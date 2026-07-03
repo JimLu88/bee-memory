@@ -255,7 +255,6 @@ def reindex_concepts(rebuild_edges: bool = True, limit: int = 0) -> dict[str, An
         c.execute("DELETE FROM mem_concepts")
         c.execute("DELETE FROM concept_edges")
         c.execute("DELETE FROM memories_fts")
-        c.execute("DELETE FROM edges WHERE kind='cooccur' OR kind IS NULL")
 
         # pass 1: 抽实体 + 建倒排索引 concept -> [memory_ids].
         # 内容去重: 12k 书库里同一本书按 persona 存了 ~81 份, 内容全同. FTS 仍逐行建(每行可搜),
@@ -338,6 +337,8 @@ def reindex_concepts(rebuild_edges: bool = True, limit: int = 0) -> dict[str, An
         stats["concept_edges"] = len(cc_w) * 2
 
         if rebuild_edges:
+            # 只在真重建时才清 cooccur (保住 provenance/supersede); 否则会留下无密度的空图.
+            c.execute("DELETE FROM edges WHERE kind='cooccur' OR kind IS NULL")
             # 每条记忆只留最强 MAX_EDGES_PER_MEM 条邻居, 且共享 >= MIN_SHARED
             by_mem: dict[str, list[tuple[str, float]]] = defaultdict(list)
             for (a, b), w in pair_w.items():
