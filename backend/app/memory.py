@@ -5,9 +5,12 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+import logging
+
 from . import associative  # v4 关联层 (概念图/FTS/共现边), 纯增量
 from . import semantic      # v4 语义向量层 (bge-m3 嵌入)
 
+_log = logging.getLogger("bee.memory")
 router = APIRouter()
 
 
@@ -86,21 +89,21 @@ def store(req: StoreRequest) -> dict:
             "INSERT INTO memories (id,kind,content,mode_id,importance,created_ts,last_recall_ts,emotional_tag,meta) VALUES (?,?,?,?,?,?,?,?,?)",
             (mid, req.kind, req.content, req.mode_id, req.importance, now, now, req.emotional_tag, json.dumps(req.meta, ensure_ascii=False)),
         )
-        # v4: 写入即增量索引 (概念/FTS/dangling). 失败绝不破坏 store.
+        # v4: 写入即增量索引 (概念/FTS/dangling). 失败绝不破坏 store, 但记日志 (别静默吞).
         try:
             associative.index_one_memory(c, mid, req.content)
         except Exception:
-            pass
+            _log.warning("index_one_memory failed for %s", mid, exc_info=True)
         try:  # token_count (让检索结果能标 token 预算)
             c.execute("UPDATE memories SET token_count=? WHERE id=?",
                       (max(1, len(req.content or "") // 3), mid))
         except Exception:
-            pass
+            _log.debug("token_count update failed for %s", mid, exc_info=True)
         try:  # 写入即嵌入 (Ollama 挂了自动降级, 不阻断 store)
             semantic.embed_and_store(c, mid, req.content)
             semantic.invalidate_cache()
         except Exception:
-            pass
+            _log.warning("embed_and_store failed for %s", mid, exc_info=True)
         try:  # v4: 重要记忆(>=4)自动入复习闸, 否则复习页永远空
             if req.importance >= 4:
                 c.execute(
@@ -226,6 +229,7 @@ def recall(
     if persona_id:
         # meta 是 JSON 文本, 形如 {"persona_id": "head_fd_...", ...}; 用 LIKE 匹配该字段值.
         where.append("meta LIKE ?"); params.append(f'%"persona_id": "{persona_id}"%')
+    where.append("invalid_at IS NULL")  # v5 双时序: 默认只回有效记忆 (失效/被取代的不出现), 覆盖两分支
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     fts_ids: list[str] = []
     with _conn() as c:
@@ -351,6 +355,7 @@ def _hard_delete(c: sqlite3.Connection, mid: str) -> None:
     c.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
     c.execute("DELETE FROM memories_vec WHERE memory_id=?", (mid,))  # v4: 别留孤儿向量
     c.execute("DELETE FROM edges WHERE src=? OR dst=?", (mid, mid))
+    c.execute("DELETE FROM typed_edges WHERE src=? OR dst=?", (mid, mid))  # v5: 清类型化边
     c.execute("DELETE FROM review_state WHERE memory_id=?", (mid,))
 
 

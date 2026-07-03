@@ -77,20 +77,19 @@ def test_distill_creates_semantic_with_provenance(db, monkeypatch):
         "title": "定价与部署口径", "insight": "促销价按日常倒推系数; 系数改动须与引擎同步部署否则失效。", "worth": True})
     _store("episodic", "定价改倒推系数", importance=4)
     _store("episodic", "定价系数须与部署同步", importance=4)
+    r = sleep_cycle._distill_episodics()
+    assert r["distilled"] >= 1
     with memory._conn() as c:
-        r = sleep_cycle._distill_episodics(c)
-        assert r["distilled"] >= 1
         assert c.execute("SELECT COUNT(*) FROM memories WHERE kind='semantic'").fetchone()[0] >= 1
         cons = c.execute("SELECT COUNT(*) FROM memories WHERE meta LIKE '%\"consolidated\": true%'").fetchone()[0]
         assert cons >= 1
-        assert c.execute("SELECT COUNT(*) FROM edges").fetchone()[0] >= 2
+        assert c.execute("SELECT COUNT(*) FROM edges WHERE kind='provenance'").fetchone()[0] >= 2
 
 
 def test_distill_skips_when_llm_down(db, monkeypatch):
     monkeypatch.setattr(llm, "available", lambda: False)
     _store("episodic", "某经历", importance=5)
-    with memory._conn() as c:
-        r = sleep_cycle._distill_episodics(c)
+    r = sleep_cycle._distill_episodics()
     assert r.get("distilled", 0) == 0 and "skipped" in r
 
 
@@ -98,8 +97,7 @@ def test_distill_never_touches_books(db, monkeypatch):
     monkeypatch.setattr(llm, "available", lambda: True)
     monkeypatch.setattr(llm, "chat_json", lambda p, system="": {"title": "x", "insight": "y", "worth": True})
     _store("knowledge_book", "某本书的内容", importance=5)
-    with memory._conn() as c:
-        r = sleep_cycle._distill_episodics(c)
+    r = sleep_cycle._distill_episodics()
     assert r["distilled"] == 0, "书本不参与经验固化"
 
 
@@ -110,9 +108,9 @@ def test_typed_edges_labels_relation(db, monkeypatch):
     _store("semantic", "定价系数改动 甲")
     _store("semantic", "定价弹窗失效 乙")
     associative.reindex_concepts(rebuild_edges=True)
+    r = sleep_cycle._typed_edges()
+    assert r["typed"] >= 1
     with memory._conn() as c:
-        r = sleep_cycle._typed_edges(c)
-        assert r["typed"] >= 1
         te = c.execute("SELECT rel_type, because FROM typed_edges").fetchone()
         assert te[0] == "causes" and "弹窗" in te[1]
 
@@ -123,8 +121,7 @@ def test_typed_edges_none_skipped(db, monkeypatch):
     _store("semantic", "毫不相关的甲")
     _store("semantic", "毫不相关的乙")
     associative.reindex_concepts(rebuild_edges=True)
-    with memory._conn() as c:
-        sleep_cycle._typed_edges(c)
+    sleep_cycle._typed_edges()
     with memory._conn() as c:
         assert c.execute("SELECT COUNT(*) FROM typed_edges").fetchone()[0] == 0
 
@@ -139,6 +136,51 @@ def test_encoding_context_boost(db):
     a_plain = next((it["score"] for it in no_boost["items"] if it["id"] == m1), None)
     assert a_boosted is not None and a_plain is not None
     assert a_boosted > a_plain
+
+
+def test_memory_recall_filters_invalid(db):
+    """回归 bug#1/#4: memory.recall (persona/默认路径) 也要过滤失效记忆."""
+    a = _store("knowledge_book", "定价口径旧版甲")
+    _store("knowledge_book", "定价口径新版乙")
+    from app.associative import InvalidateIn, invalidate_endpoint
+    invalidate_endpoint(InvalidateIn(memory_id=a))
+    from app.memory import recall
+    r = recall(query="定价口径", k=8, fts=0)
+    assert a not in [it["id"] for it in r["items"]], "memory.recall 默认路径不该回失效记忆"
+    r2 = recall(query="定价口径", k=8, fts=1)
+    assert a not in [it["id"] for it in r2["items"]], "memory.recall FTS 路径也不该回失效记忆"
+
+
+def test_provenance_edge_survives_reindex(db, monkeypatch):
+    """回归 bug#5/#7: 蒸馏溯源边 (kind=provenance) 不被 reindex 清掉."""
+    monkeypatch.setattr(llm, "available", lambda: True)
+    monkeypatch.setattr(llm, "chat_json", lambda p, system="": {"title": "T", "insight": "知识精华内容", "worth": True})
+    _store("episodic", "定价改倒推系数甲", importance=4)
+    _store("episodic", "定价系数须与部署同步乙", importance=4)
+    sleep_cycle._distill_episodics()
+    with memory._conn() as c:
+        before = c.execute("SELECT COUNT(*) FROM edges WHERE kind='provenance'").fetchone()[0]
+    associative.reindex_concepts(rebuild_edges=True)
+    with memory._conn() as c:
+        after = c.execute("SELECT COUNT(*) FROM edges WHERE kind='provenance'").fetchone()[0]
+    assert before >= 2 and after == before, "reindex 不能清掉 provenance 边"
+
+
+def test_forget_cleans_typed_edges(db, monkeypatch):
+    """回归 bug#13: forget 要清 typed_edges."""
+    monkeypatch.setattr(llm, "available", lambda: True)
+    monkeypatch.setattr(llm, "chat_json", lambda p, system="": {
+        "rel": "causes", "direction": "a_to_b", "because": "甲导致乙"})
+    a = _store("semantic", "定价系数改动 甲")
+    _store("semantic", "定价弹窗失效 乙")
+    associative.reindex_concepts(rebuild_edges=True)
+    sleep_cycle._typed_edges()
+    with memory._conn() as c:
+        assert c.execute("SELECT COUNT(*) FROM typed_edges").fetchone()[0] >= 1
+    from app.memory import ForgetIn, forget
+    forget(ForgetIn(memory_id=a, force=True))
+    with memory._conn() as c:
+        assert c.execute("SELECT COUNT(*) FROM typed_edges WHERE src=? OR dst=?", (a, a)).fetchone()[0] == 0
 
 
 def test_stability_uses_review_state(db):

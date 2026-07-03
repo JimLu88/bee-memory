@@ -173,6 +173,11 @@ def ensure_associative_schema(c: sqlite3.Connection) -> None:
                           ("invalid_at", "INTEGER"), ("superseded_by", "TEXT")):
             if col not in cols:
                 c.execute(f"ALTER TABLE memories ADD COLUMN {col} {decl}")
+    # v5 P2: edges 加 kind (cooccur|provenance|supersede), 让 reindex 只清 cooccur, 保住溯源/取代边
+    if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='edges'").fetchone():
+        ecols = {r[1] for r in c.execute("PRAGMA table_info(edges)")}
+        if "kind" not in ecols:
+            c.execute("ALTER TABLE edges ADD COLUMN kind TEXT DEFAULT 'cooccur'")
 
 
 def _cid(name: str) -> str:
@@ -237,7 +242,7 @@ def reindex_concepts(rebuild_edges: bool = True, limit: int = 0) -> dict[str, An
                              "cooccur_edges": 0, "concept_edges": 0, "hub_concepts": 0,
                              "buckets_capped": 0, "fts_rows": 0}
     with _conn() as c:
-        q = "SELECT id, content, kind FROM memories"
+        q = "SELECT id, content, kind FROM memories WHERE invalid_at IS NULL"  # 失效记忆不进概念图/FTS
         if limit > 0:
             q += f" ORDER BY last_recall_ts DESC LIMIT {int(limit)}"
         rows = c.execute(q).fetchall()
@@ -245,11 +250,12 @@ def reindex_concepts(rebuild_edges: bool = True, limit: int = 0) -> dict[str, An
         if not rows:
             return {**stats, "status": "empty", "elapsed_s": round(time.time() - t0, 2)}
 
-        # 全量重建概念表: 先清空派生表 (memories/edges 里的旧值不动)
+        # 全量重建概念表: 清空派生表. edges 只清 cooccur (保住 provenance/supersede 边), 防陈边永久累积.
         c.execute("DELETE FROM concepts")
         c.execute("DELETE FROM mem_concepts")
         c.execute("DELETE FROM concept_edges")
         c.execute("DELETE FROM memories_fts")
+        c.execute("DELETE FROM edges WHERE kind='cooccur' OR kind IS NULL")
 
         # pass 1: 抽实体 + 建倒排索引 concept -> [memory_ids].
         # 内容去重: 12k 书库里同一本书按 persona 存了 ~81 份, 内容全同. FTS 仍逐行建(每行可搜),
@@ -347,7 +353,8 @@ def reindex_concepts(rebuild_edges: bool = True, limit: int = 0) -> dict[str, An
                     for s, d in ((mid, nb), (nb, mid)):
                         if (s, d) in written:
                             continue
-                        c.execute("INSERT OR REPLACE INTO edges(src,dst,weight) VALUES (?,?,?)", (s, d, w))
+                        # OR IGNORE: 若该对已有 provenance/supersede 边则不覆盖 (它们更权威)
+                        c.execute("INSERT OR IGNORE INTO edges(src,dst,weight,kind) VALUES (?,?,?,'cooccur')", (s, d, w))
                         written.add((s, d))
                         deg[s] += 1
                         edge_count += 1
@@ -586,6 +593,8 @@ def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
             final = 0.5 * vs + 0.3 * ps + 0.2 * ac
             if boost_mode and r["mode_id"] == boost_mode:  # 编码特异性: 同项目/同语境的记忆提分
                 final += 0.08
+            if r["meta"] and '"consolidated": true' in r["meta"]:  # 已蒸馏的源: 略降, 让语义笔记优先
+                final -= 0.05
             via = []
             if mid in vec_map:
                 via.append("语义")
@@ -641,9 +650,15 @@ def recall_hybrid_endpoint(query: str, k: int = 8, persona_id: str = "", kind: s
 
 
 def _rich_seeds(c, query: str, k: int = 12) -> list[str]:
-    """连接用的种子: 语义(向量) + 字面 并集. 比纯 LIKE 更可能命中有边的节点."""
+    """连接用的种子: 语义(向量) + 字面 并集, 排除失效记忆. 比纯 LIKE 更可能命中有边的节点."""
     vec = [m for m, _ in semantic.vector_search(c, query, k=k)]
-    return list(dict.fromkeys(vec + entry_search(c, query, k)))
+    seeds = list(dict.fromkeys(vec + entry_search(c, query, k)))
+    if not seeds:
+        return seeds
+    ph = ",".join("?" * len(seeds))
+    valid = {r[0] for r in c.execute(
+        f"SELECT id FROM memories WHERE id IN ({ph}) AND invalid_at IS NULL", seeds)}
+    return [s for s in seeds if s in valid]
 
 
 @router.get("/connect2")
@@ -739,8 +754,8 @@ def supersede_endpoint(req: SupersedeIn) -> dict:
             return {"status": "error", "detail": "new_id 不存在"}
         c.execute("UPDATE memories SET invalid_at=?, superseded_by=? WHERE id=?",
                   (now, req.new_id, req.old_id))
-        # 取代边 (新 -> 旧), 便于回溯"我当时以为什么"
-        c.execute("INSERT OR REPLACE INTO edges(src,dst,weight) VALUES (?,?,?)",
+        # 取代边 (新 -> 旧, kind=supersede 不被 reindex 清), 便于回溯"我当时以为什么"
+        c.execute("INSERT OR REPLACE INTO edges(src,dst,weight,kind) VALUES (?,?,?,'supersede')",
                   (req.new_id, req.old_id, 3.0))
     ppr.invalidate_cache()
     return {"status": "ok", "old_id": req.old_id, "new_id": req.new_id, "invalid_at": now}
@@ -769,7 +784,7 @@ def digest_endpoint(project: str = "", limit: int = 8) -> dict:
         if not top:
             rows = c.execute(
                 "SELECT id, content, kind, importance, token_count FROM memories "
-                "ORDER BY importance DESC, last_recall_ts DESC LIMIT ?", (limit,)).fetchall()
+                "WHERE invalid_at IS NULL ORDER BY importance DESC, last_recall_ts DESC LIMIT ?", (limit,)).fetchall()
             for r in rows:
                 title, snip = _title_snippet(r["content"])
                 top.append({"id": r["id"], "title": title, "snippet": snip,

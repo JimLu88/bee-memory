@@ -153,28 +153,42 @@ DISTILL_MAX_CLUSTERS = int(os.environ.get("BEE_DISTILL_MAX", "5"))
 DISTILL_SIM = float(os.environ.get("BEE_DISTILL_SIM", "0.55"))
 
 
-def _distill_episodics(c, max_clusters: int = DISTILL_MAX_CLUSTERS, max_src: int = 40) -> dict[str, Any]:
+def _norm_bool(v) -> bool:
+    """LLM 有时把布尔当字符串返回 ('false'/'否'), 规范化."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "是", "y")
+    return bool(v)
+
+
+def _distill_episodics(max_clusters: int = DISTILL_MAX_CLUSTERS, max_src: int = 40) -> dict[str, Any]:
     """P2 经验固化 (CLS 新皮层慢学): 把亲历 episodic/procedural 聚类, LLM 蒸馏成可复用 semantic 笔记,
     建双向溯源边, 源标记 consolidated. 只碰经验类, 绝不碰 book/standard/moc. LLM 不可用则跳过.
+
+    三段分离 (关键: 绝不在持写锁时调 LLM): ①读连接采样+聚类 ②无 DB 连接时逐簇调 LLM ③短写事务逐条落库.
     """
     if not llm.available():
         return {"skipped": "llm 不可用", "distilled": 0}
+    from .memory import _conn
     import numpy as np
-    rows = c.execute(
-        "SELECT id, content, importance FROM memories "
-        "WHERE kind IN ('episodic','procedural') AND invalid_at IS NULL "
-        "AND (meta IS NULL OR meta NOT LIKE '%\"consolidated\": true%') "
-        "ORDER BY created_ts DESC LIMIT ?", (max_src,)).fetchall()
-    if not rows:
-        return {"distilled": 0, "note": "无待固化经验"}
-    ids = [r[0] for r in rows]
-    content = {r[0]: (r[1] or "") for r in rows}
-    imp = {r[0]: (r[2] or 0) for r in rows}
-    ph = ",".join("?" * len(ids))
-    vmap: dict[str, Any] = {}
-    for mid, dim, blob in c.execute(f"SELECT memory_id,dim,vec FROM memories_vec WHERE memory_id IN ({ph})", ids):
-        vmap[mid] = np.frombuffer(blob, dtype=np.float32, count=dim)
-    # 贪心聚类 (cosine > DISTILL_SIM); 无向量的各自成簇
+
+    # ---- 阶段1: 读 (采样 + 向量 + 聚类), 读完即释放连接 ----
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, content, importance FROM memories "
+            "WHERE kind IN ('episodic','procedural') AND invalid_at IS NULL "
+            "AND (meta IS NULL OR meta NOT LIKE '%\"consolidated\": true%') "
+            "ORDER BY created_ts DESC LIMIT ?", (max_src,)).fetchall()
+        if not rows:
+            return {"distilled": 0, "note": "无待固化经验"}
+        ids = [r[0] for r in rows]
+        content = {r[0]: (r[1] or "") for r in rows}
+        imp = {r[0]: (r[2] or 0) for r in rows}
+        ph = ",".join("?" * len(ids))
+        vmap: dict[str, Any] = {}
+        for mid, dim, blob in c.execute(f"SELECT memory_id,dim,vec FROM memories_vec WHERE memory_id IN ({ph})", ids):
+            v = np.frombuffer(blob, dtype=np.float32, count=dim)
+            if v.shape[0] == semantic.EMBED_DIM:   # 维度守卫: 混维不参与点积 (防崩溃)
+                vmap[mid] = v
     clusters: list[list[str]] = []
     used: set[str] = set()
     for a in ids:
@@ -191,13 +205,13 @@ def _distill_episodics(c, max_clusters: int = DISTILL_MAX_CLUSTERS, max_src: int
         if i not in used:
             clusters.append([i]); used.add(i)
 
-    made = 0
-    now = int(time.time())
+    # ---- 阶段2: 无 DB 连接时调 LLM (可能各 120s), 结果攒内存 ----
+    pending: list[tuple[list[str], str, str]] = []
     for grp in clusters:
-        if made >= max_clusters:
+        if len(pending) >= max_clusters:
             break
         if len(grp) < 2 and imp.get(grp[0], 0) < 4:
-            continue  # 单条只固化重要的 (importance>=4)
+            continue
         bodies = "\n---\n".join(f"[{i}] {content[i][:600]}" for i in grp)
         data = llm.chat_json(
             "下面是若干条亲历记忆(经历/决策/踩坑)。请提炼成 1 条**可复用的语义知识**"
@@ -205,89 +219,116 @@ def _distill_episodics(c, max_clusters: int = DISTILL_MAX_CLUSTERS, max_src: int
             '输出 JSON: {"title":"一句话标题", "insight":"120-300字的知识精华", "worth": true/false}\n'
             "worth=false 表示这些内容太琐碎不值得固化。\n记忆:\n" + bodies,
             system="你是记忆固化专家, 只输出合法JSON。")
-        if not data or not data.get("worth") or not data.get("insight"):
+        if not isinstance(data, dict) or not _norm_bool(data.get("worth")) or not data.get("insight"):
             continue
         title = str(data.get("title") or "")[:80]
-        insight = str(data["insight"])[:2000]
+        insight = str(data.get("insight"))[:2000]
+        pending.append((grp, title, insight))
+
+    # ---- 阶段3: 逐条短写事务落库 (每条独立提交, 不长时持锁) ----
+    made = 0
+    for grp, title, insight in pending:
         sem_content = f"{title}\n{insight}" if title else insight
+        vec = semantic.embed_text(sem_content)  # 嵌在写事务外
         sem_id = "m-" + _uuid.uuid4().hex[:12]
         meta = _json.dumps({"distilled_from": grp, "auto": True, "title": title}, ensure_ascii=False)
-        c.execute("INSERT INTO memories(id,kind,content,mode_id,importance,created_ts,last_recall_ts,meta) "
-                  "VALUES (?,?,?,?,?,?,?,?)", (sem_id, "semantic", sem_content, "", 4, now, now, meta))
-        try:
-            semantic.embed_and_store(c, sem_id, sem_content)
-        except Exception:
-            pass
-        try:
-            associative.index_one_memory(c, sem_id, sem_content)
-        except Exception:
-            pass
-        for i in grp:  # 双向溯源边 + 标记源已固化 (可回溯"这条知识从哪来")
-            c.execute("INSERT OR REPLACE INTO edges(src,dst,weight) VALUES (?,?,3.0)", (sem_id, i))
-            c.execute("INSERT OR REPLACE INTO edges(src,dst,weight) VALUES (?,?,3.0)", (i, sem_id))
-            srow = c.execute("SELECT meta FROM memories WHERE id=?", (i,)).fetchone()
+        now = int(time.time())
+        with _conn() as c:
+            c.execute("INSERT INTO memories(id,kind,content,mode_id,importance,created_ts,last_recall_ts,meta) "
+                      "VALUES (?,?,?,?,?,?,?,?)", (sem_id, "semantic", sem_content, "", 4, now, now, meta))
+            if vec is not None:
+                semantic.store_vector(c, sem_id, vec)
             try:
-                m = _json.loads(srow[0] or "{}")
+                associative.index_one_memory(c, sem_id, sem_content)
             except Exception:
-                m = {}
-            m["consolidated"] = True
-            m["consolidated_into"] = sem_id
-            c.execute("UPDATE memories SET meta=? WHERE id=?", (_json.dumps(m, ensure_ascii=False), i))
+                pass
+            for i in grp:  # 双向溯源边 (kind=provenance, reindex 不会清) + 源标记 consolidated
+                c.execute("INSERT OR REPLACE INTO edges(src,dst,weight,kind) VALUES (?,?,3.0,'provenance')", (sem_id, i))
+                c.execute("INSERT OR REPLACE INTO edges(src,dst,weight,kind) VALUES (?,?,3.0,'provenance')", (i, sem_id))
+                srow = c.execute("SELECT meta FROM memories WHERE id=?", (i,)).fetchone()
+                try:
+                    m = _json.loads(srow[0] or "{}")
+                except Exception:
+                    m = {}
+                m["consolidated"] = True
+                m["consolidated_into"] = sem_id
+                c.execute("UPDATE memories SET meta=? WHERE id=?", (_json.dumps(m, ensure_ascii=False), i))
         made += 1
     semantic.invalidate_cache()
-    ppr = associative.ppr
-    ppr.invalidate_cache()
+    associative.ppr.invalidate_cache()
     return {"distilled": made, "candidates": len(rows)}
 
 
 TYPED_MAX_PAIRS = int(os.environ.get("BEE_TYPED_MAX", "20"))
 
 
-def _typed_edges(c, max_pairs: int = TYPED_MAX_PAIRS) -> dict[str, Any]:
+def _typed_edges(max_pairs: int = TYPED_MAX_PAIRS) -> dict[str, Any]:
     """P2 类型化边: 对经验类记忆(含蒸馏 semantic)的候选对, LLM 标关系类型+because 理由并存向量.
-    候选 = 已有共现边 ∪ embedding kNN(0.4<sim<0.92). 只碰经验类, 不碰书本. LLM 挂了跳过.
+    候选 = 已有共现边 ∪ embedding kNN(0.4<sim<0.92); 排除蒸馏溯源对(冗余). 三段分离不跨 LLM 持写锁.
     """
     if not llm.available():
         return {"skipped": "llm 不可用", "typed": 0}
+    from .memory import _conn
     import struct
     import uuid as _u
 
     import numpy as np
-    rows = c.execute(
-        "SELECT id, content FROM memories WHERE kind IN ('episodic','procedural','semantic') "
-        "AND invalid_at IS NULL ORDER BY created_ts DESC LIMIT 60").fetchall()
-    if len(rows) < 2:
-        return {"typed": 0, "note": "经验记忆不足"}
-    ids = [r[0] for r in rows]
-    content = {r[0]: (r[1] or "") for r in rows}
-    ph = ",".join("?" * len(ids))
-    vmap: dict[str, Any] = {}
-    for mid, dim, blob in c.execute(f"SELECT memory_id,dim,vec FROM memories_vec WHERE memory_id IN ({ph})", ids):
-        vmap[mid] = np.frombuffer(blob, dtype=np.float32, count=dim)
-    cand: set[tuple[str, str]] = set()
-    for s, d in c.execute(f"SELECT src,dst FROM edges WHERE src IN ({ph})", ids):
-        if d in content:
-            cand.add(tuple(sorted((s, d))))
-    vids = [i for i in ids if i in vmap]
-    for i in range(len(vids)):
-        for j in range(i + 1, len(vids)):
-            sim = float(vmap[vids[i]] @ vmap[vids[j]])
-            if 0.4 < sim < 0.92:
-                cand.add(tuple(sorted((vids[i], vids[j]))))
-    made = 0
-    for a, b in list(cand)[:max_pairs]:
-        if c.execute("SELECT 1 FROM typed_edges WHERE (src=? AND dst=?) OR (src=? AND dst=?)",
-                     (a, b, b, a)).fetchone():
-            continue
+    # ---- 阶段1: 读 ----
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, content, meta FROM memories WHERE kind IN ('episodic','procedural','semantic') "
+            "AND invalid_at IS NULL ORDER BY created_ts DESC LIMIT 60").fetchall()
+        if len(rows) < 2:
+            return {"typed": 0, "note": "经验记忆不足"}
+        ids = [r[0] for r in rows]
+        content = {r[0]: (r[1] or "") for r in rows}
+        # 蒸馏溯源对 (semantic 的 distilled_from 含某源) 不再标类型边 (已有 provenance 边, 冗余)
+        prov: set[tuple[str, str]] = set()
+        for r in rows:
+            try:
+                df = _json.loads(r[2] or "{}").get("distilled_from") or []
+            except Exception:
+                df = []
+            for src in df:
+                prov.add(tuple(sorted((r[0], src))))
+        ph = ",".join("?" * len(ids))
+        vmap: dict[str, Any] = {}
+        for mid, dim, blob in c.execute(f"SELECT memory_id,dim,vec FROM memories_vec WHERE memory_id IN ({ph})", ids):
+            v = np.frombuffer(blob, dtype=np.float32, count=dim)
+            if v.shape[0] == semantic.EMBED_DIM:
+                vmap[mid] = v
+        cand: set[tuple[str, str]] = set()
+        for s, d in c.execute(f"SELECT src,dst FROM edges WHERE src IN ({ph})", ids):
+            if d in content:
+                cand.add(tuple(sorted((s, d))))
+        vids = [i for i in ids if i in vmap]
+        for i in range(len(vids)):
+            for j in range(i + 1, len(vids)):
+                sim = float(vmap[vids[i]] @ vmap[vids[j]])
+                if 0.4 < sim < 0.92:
+                    cand.add(tuple(sorted((vids[i], vids[j]))))
+        cand -= prov
+        # 已标过的对 (任一方向) 跳过
+        todo = []
+        for a, b in list(cand)[:max_pairs]:
+            if not c.execute("SELECT 1 FROM typed_edges WHERE (src=? AND dst=?) OR (src=? AND dst=?)",
+                             (a, b, b, a)).fetchone():
+                todo.append((a, b))
+
+    # ---- 阶段2: LLM (无 DB 连接) ----
+    results = []
+    for a, b in todo:
         data = llm.chat_json(
             f"判断记忆A和B的关系。\nA: {content[a][:400]}\nB: {content[b][:400]}\n"
             '输出 JSON: {"rel":"causes|part_of|contradicts|supports|relates|none",'
             '"direction":"a_to_b|b_to_a|mutual","because":"一句话说明为什么"}\n'
             "rel=none 表示没有实质关系。",
             system="你判断两条知识的关系, 只输出合法JSON。")
-        if not data or data.get("rel") in (None, "none", "", "relates_none"):
+        if not isinstance(data, dict):
             continue
-        rel = str(data.get("rel"))[:20]
+        rel = data.get("rel")
+        if not isinstance(rel, str) or rel in ("none", "", "relates_none"):
+            continue
         because = str(data.get("because") or "")[:300]
         src, dst = (b, a) if data.get("direction") == "b_to_a" else (a, b)
         eb = None
@@ -295,11 +336,17 @@ def _typed_edges(c, max_pairs: int = TYPED_MAX_PAIRS) -> dict[str, Any]:
             emb = semantic.embed_text(because)
             if emb:
                 eb = struct.pack(f"{len(emb)}f", *emb)
-        c.execute("INSERT INTO typed_edges(id,src,dst,rel_type,because,weight,embedding,created_ts) "
-                  "VALUES (?,?,?,?,?,?,?,?)",
-                  ("te-" + _u.uuid4().hex[:10], src, dst, rel, because, 2.0, eb, int(time.time())))
+        results.append((src, dst, rel[:20], because, eb))
+
+    # ---- 阶段3: 短写事务 ----
+    made = 0
+    for src, dst, rel, because, eb in results:
+        with _conn() as c:
+            c.execute("INSERT INTO typed_edges(id,src,dst,rel_type,because,weight,embedding,created_ts) "
+                      "VALUES (?,?,?,?,?,?,?,?)",
+                      ("te-" + _u.uuid4().hex[:10], src, dst, rel, because, 2.0, eb, int(time.time())))
         made += 1
-    return {"typed": made, "candidates": len(cand)}
+    return {"typed": made, "candidates": len(todo)}
 
 
 def _backup() -> dict[str, Any]:
@@ -343,11 +390,9 @@ def run_sleep_cycle(do_forget: bool = False, render_vault: bool = True) -> dict[
     from .memory import _conn, consolidate, forget, ForgetIn
     t0 = time.time()
     out: dict[str, Any] = {}
-    with _conn() as c:
-        out["distill"] = _distill_episodics(c)    # 0a 经验固化 episodic→semantic (LLM, 先做再 reindex)
+    out["distill"] = _distill_episodics()         # 0a 经验固化 episodic→semantic (LLM, 自管短事务)
     out["consolidate"] = consolidate()            # 1+3 reindex + dangling promote
-    with _conn() as c:
-        out["typed_edges"] = _typed_edges(c)      # 0b 类型化边 (LLM, reindex 后经验记忆已就位)
+    out["typed_edges"] = _typed_edges()           # 0b 类型化边 (LLM, 自管短事务)
     out["backfill"] = semantic.backfill()         # 2 补嵌入
     with _conn() as c:
         out["stability_updated"] = _update_stability(c)  # 4

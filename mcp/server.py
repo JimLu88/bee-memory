@@ -85,16 +85,20 @@ def _guard() -> str | None:
 
 # ---------- 工具 ----------
 @mcp.tool()
-def brain_recall(query: str, k: int = 8) -> str:
+def brain_recall(query: str, k: int = 8, project: str = "") -> str:
     """跨会话检索长期记忆 (语义+字面+关联扩散). 新任务开始前、需要历史决策/踩坑/口径时调用。
 
+    project: 可选, 传当前项目名 (如 'panse'/'aistock'), 同项目记忆会被优先 (编码语境加权)。
     返回紧凑列表 (标题+摘要+来源+id); 要看某条全文用 brain_get。
     """
     g = _guard()
     if g:
         return g
     try:
-        r = _req("GET", "/memory/recall-hybrid", {"query": query, "k": k, "compact": 1})
+        params = {"query": query, "k": k, "compact": 1}
+        if project:
+            params["boost_mode"] = project
+        r = _req("GET", "/memory/recall-hybrid", params)
     except Exception as e:
         return f"检索失败: {e}"
     items = r.get("items", [])
