@@ -1,0 +1,155 @@
+"""v5 Phase 2 测试 — 双时序失效 / episodic→semantic 蒸馏 / 类型化边 / 语境 / FSRS.
+LLM 与嵌入全 mock, 不依赖 Ollama."""
+from __future__ import annotations
+
+import hashlib
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+BACKEND = Path(__file__).resolve().parents[1]
+if str(BACKEND) not in sys.path:
+    sys.path.insert(0, str(BACKEND))
+
+from app import associative, llm, memory, ppr, semantic, sleep_cycle  # noqa: E402
+
+
+def _fake_vec(text, timeout=None, dim=1024):
+    h = int(hashlib.md5((text or "").encode()).hexdigest(), 16)
+    rng = np.random.default_rng(h % (2**32))
+    v = rng.standard_normal(dim).astype(np.float32)
+    for kw in ("定价", "部署", "风险"):
+        if kw in (text or ""):
+            k = np.random.default_rng(int(hashlib.md5(kw.encode()).hexdigest(), 16) % (2**32))
+            v += 3.0 * k.standard_normal(dim).astype(np.float32)
+    v /= (np.linalg.norm(v) or 1.0)
+    return v.tolist()
+
+
+@pytest.fixture()
+def db(tmp_path, monkeypatch):
+    p = tmp_path / "m.sqlite"
+    for mod in (memory, associative, semantic, ppr):
+        monkeypatch.setattr(mod, "DB_PATH", p)
+    monkeypatch.setattr(semantic, "embed_text", _fake_vec)
+    monkeypatch.setattr(semantic, "embed_batch", lambda ts: [_fake_vec(t) for t in ts])
+    monkeypatch.setattr(sleep_cycle, "VAULT_DIR", tmp_path / "vault")
+    semantic.invalidate_cache(); ppr.invalidate_cache(); semantic._QCACHE.clear()
+    with memory._conn():
+        pass
+    return p
+
+
+def _store(kind, content, importance=3, mode_id=""):
+    from app.memory import StoreRequest, store
+    return store(StoreRequest(kind=kind, content=content, importance=importance, mode_id=mode_id))["memory_id"]
+
+
+def test_invalidate_hides_from_recall(db):
+    a = _store("semantic", "定价口径旧版甲")
+    _store("semantic", "定价口径旧版乙")
+    associative.reindex_concepts(rebuild_edges=True)
+    from app.associative import InvalidateIn, invalidate_endpoint
+    invalidate_endpoint(InvalidateIn(memory_id=a))
+    res = associative.hybrid_recall("定价口径", k=8)
+    assert a not in [it["id"] for it in res["items"]], "失效记忆不该出现在常规召回"
+    with memory._conn() as c:
+        assert c.execute("SELECT invalid_at FROM memories WHERE id=?", (a,)).fetchone()[0] is not None
+
+
+def test_supersede_sets_flags_and_edge(db):
+    old = _store("semantic", "定价旧结论")
+    new = _store("semantic", "定价新结论")
+    from app.associative import SupersedeIn, supersede_endpoint
+    r = supersede_endpoint(SupersedeIn(old_id=old, new_id=new))
+    assert r["status"] == "ok"
+    with memory._conn() as c:
+        row = c.execute("SELECT invalid_at, superseded_by FROM memories WHERE id=?", (old,)).fetchone()
+        assert row[0] is not None and row[1] == new
+        assert c.execute("SELECT 1 FROM edges WHERE src=? AND dst=?", (new, old)).fetchone()
+
+
+def test_distill_creates_semantic_with_provenance(db, monkeypatch):
+    monkeypatch.setattr(llm, "available", lambda: True)
+    monkeypatch.setattr(llm, "chat_json", lambda p, system="": {
+        "title": "定价与部署口径", "insight": "促销价按日常倒推系数; 系数改动须与引擎同步部署否则失效。", "worth": True})
+    _store("episodic", "定价改倒推系数", importance=4)
+    _store("episodic", "定价系数须与部署同步", importance=4)
+    with memory._conn() as c:
+        r = sleep_cycle._distill_episodics(c)
+        assert r["distilled"] >= 1
+        assert c.execute("SELECT COUNT(*) FROM memories WHERE kind='semantic'").fetchone()[0] >= 1
+        cons = c.execute("SELECT COUNT(*) FROM memories WHERE meta LIKE '%\"consolidated\": true%'").fetchone()[0]
+        assert cons >= 1
+        assert c.execute("SELECT COUNT(*) FROM edges").fetchone()[0] >= 2
+
+
+def test_distill_skips_when_llm_down(db, monkeypatch):
+    monkeypatch.setattr(llm, "available", lambda: False)
+    _store("episodic", "某经历", importance=5)
+    with memory._conn() as c:
+        r = sleep_cycle._distill_episodics(c)
+    assert r.get("distilled", 0) == 0 and "skipped" in r
+
+
+def test_distill_never_touches_books(db, monkeypatch):
+    monkeypatch.setattr(llm, "available", lambda: True)
+    monkeypatch.setattr(llm, "chat_json", lambda p, system="": {"title": "x", "insight": "y", "worth": True})
+    _store("knowledge_book", "某本书的内容", importance=5)
+    with memory._conn() as c:
+        r = sleep_cycle._distill_episodics(c)
+    assert r["distilled"] == 0, "书本不参与经验固化"
+
+
+def test_typed_edges_labels_relation(db, monkeypatch):
+    monkeypatch.setattr(llm, "available", lambda: True)
+    monkeypatch.setattr(llm, "chat_json", lambda p, system="": {
+        "rel": "causes", "direction": "a_to_b", "because": "改动系数导致弹窗失效"})
+    _store("semantic", "定价系数改动 甲")
+    _store("semantic", "定价弹窗失效 乙")
+    associative.reindex_concepts(rebuild_edges=True)
+    with memory._conn() as c:
+        r = sleep_cycle._typed_edges(c)
+        assert r["typed"] >= 1
+        te = c.execute("SELECT rel_type, because FROM typed_edges").fetchone()
+        assert te[0] == "causes" and "弹窗" in te[1]
+
+
+def test_typed_edges_none_skipped(db, monkeypatch):
+    monkeypatch.setattr(llm, "available", lambda: True)
+    monkeypatch.setattr(llm, "chat_json", lambda p, system="": {"rel": "none"})
+    _store("semantic", "毫不相关的甲")
+    _store("semantic", "毫不相关的乙")
+    associative.reindex_concepts(rebuild_edges=True)
+    with memory._conn() as c:
+        sleep_cycle._typed_edges(c)
+    with memory._conn() as c:
+        assert c.execute("SELECT COUNT(*) FROM typed_edges").fetchone()[0] == 0
+
+
+def test_encoding_context_boost(db):
+    m1 = _store("semantic", "定价口径 项目A版", mode_id="projA")
+    _store("semantic", "定价口径 项目B版", mode_id="projB")
+    associative.reindex_concepts(rebuild_edges=True)
+    no_boost = associative.hybrid_recall("定价口径", k=2)
+    boosted = associative.hybrid_recall("定价口径", k=2, boost_mode="projA")
+    a_boosted = next((it["score"] for it in boosted["items"] if it["id"] == m1), None)
+    a_plain = next((it["score"] for it in no_boost["items"] if it["id"] == m1), None)
+    assert a_boosted is not None and a_plain is not None
+    assert a_boosted > a_plain
+
+
+def test_stability_uses_review_state(db):
+    mid = _store("semantic", "会被复习的知识", importance=3)
+    with memory._conn() as c:
+        c.execute("INSERT OR REPLACE INTO review_state(memory_id,ef,interval_days,repetitions,next_review_ts,last_grade) "
+                  "VALUES (?,2.6,30,5,?,5)", (mid, 9999999999))
+        sleep_cycle._update_stability(c)
+        s_reviewed = c.execute("SELECT stability FROM memories WHERE id=?", (mid,)).fetchone()[0]
+    mid2 = _store("semantic", "没复习的知识", importance=3)
+    with memory._conn() as c:
+        sleep_cycle._update_stability(c)
+        s_plain = c.execute("SELECT stability FROM memories WHERE id=?", (mid2,)).fetchone()[0]
+    assert s_reviewed > s_plain, "复习过的记忆存储强度更高 (更久不忘)"

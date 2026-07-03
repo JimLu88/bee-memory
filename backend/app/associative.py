@@ -144,6 +144,15 @@ def ensure_associative_schema(c: sqlite3.Connection) -> None:
             PRIMARY KEY (src, dst)
         )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_ce_src ON concept_edges(src)")
+    # v5 P2: 类型化边 (记忆↔记忆), 带关系类型 + because 理由 + because 向量 (关系可检索, LightRAG 双层)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS typed_edges (
+            id TEXT PRIMARY KEY, src TEXT, dst TEXT,
+            rel_type TEXT, because TEXT, weight REAL DEFAULT 1.0,
+            embedding BLOB, created_ts INTEGER
+        )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_te_src ON typed_edges(src)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_te_dst ON typed_edges(dst)")
     # Obsidian 式未解析链接: 先记引用, 积累够了自动立节点
     c.execute("""
         CREATE TABLE IF NOT EXISTS dangling_refs (
@@ -159,7 +168,9 @@ def ensure_associative_schema(c: sqlite3.Connection) -> None:
     # 放这里保证任何连接 (associative._conn / memory._conn) 都先迁移, 避免 SELECT * 缺列.
     if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'").fetchone():
         cols = {r[1] for r in c.execute("PRAGMA table_info(memories)")}
-        for col, decl in (("token_count", "INTEGER"), ("stability", "REAL"), ("difficulty", "REAL")):
+        # v4 P1: token_count/stability/difficulty; v5 P2 双时序: invalid_at(失效时刻)/superseded_by(被谁取代)
+        for col, decl in (("token_count", "INTEGER"), ("stability", "REAL"), ("difficulty", "REAL"),
+                          ("invalid_at", "INTEGER"), ("superseded_by", "TEXT")):
             if col not in cols:
                 c.execute(f"ALTER TABLE memories ADD COLUMN {col} {decl}")
 
@@ -514,7 +525,7 @@ def _title_snippet(content: str) -> tuple[str, str]:
 
 
 def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
-                  compact: bool = True) -> dict[str, Any]:
+                  compact: bool = True, boost_mode: str = "") -> dict[str, Any]:
     """向量(语义)+FTS(字面) 找入口 → 个性化 PageRank 沿共现边扩散 → 综合排序.
 
     综合分 = 0.5*语义相似 + 0.3*PPR扩散(归一) + 0.2*激活分(归一). 这一步负责"问A召回B".
@@ -559,7 +570,9 @@ def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
             return {"items": [], "note": "无命中"}
 
         ph = ",".join("?" * len(pool))
-        rows = c.execute(f"SELECT * FROM memories WHERE id IN ({ph})", list(pool)).fetchall()
+        # 双时序: 默认只回仍有效的 (invalid_at IS NULL). 被取代的旧事实不出现在常规召回.
+        rows = c.execute(f"SELECT * FROM memories WHERE id IN ({ph}) AND invalid_at IS NULL",
+                         list(pool)).fetchall()
         # 激活分归一
         acts = {r["id"]: _activation_score(dict(r), now) for r in rows}
         max_act = max(acts.values()) if acts else 1.0
@@ -571,6 +584,8 @@ def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
             ps = (ppr_scores.get(mid, 0.0) / max_ppr) if max_ppr else 0.0
             ac = (acts[mid] / max_act) if max_act else 0.0
             final = 0.5 * vs + 0.3 * ps + 0.2 * ac
+            if boost_mode and r["mode_id"] == boost_mode:  # 编码特异性: 同项目/同语境的记忆提分
+                final += 0.08
             via = []
             if mid in vec_map:
                 via.append("语义")
@@ -619,9 +634,10 @@ def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
 
 @router.get("/recall-hybrid")
 def recall_hybrid_endpoint(query: str, k: int = 8, persona_id: str = "", kind: str = "",
-                           compact: int = 1) -> dict:
-    """P1 混合检索端点 (语义+字面+关联扩散). 默认紧凑返回 (省 token)."""
-    return hybrid_recall(query, k=k, persona_id=persona_id, kind=kind, compact=bool(compact))
+                           compact: int = 1, boost_mode: str = "") -> dict:
+    """P1 混合检索端点 (语义+字面+关联扩散). 默认紧凑返回 (省 token). boost_mode=同项目提分."""
+    return hybrid_recall(query, k=k, persona_id=persona_id, kind=kind,
+                         compact=bool(compact), boost_mode=boost_mode)
 
 
 def _rich_seeds(c, query: str, k: int = 12) -> list[str]:
@@ -637,8 +653,20 @@ def connect_ppr_endpoint(a: str, b: str, k: int = 12) -> dict:
         c.row_factory = sqlite3.Row
         a_ids = _rich_seeds(c, a, k)
         b_ids = _rich_seeds(c, b, k)
+        # 直接类型化关系 (最强信号: A 侧记忆与 B 侧记忆之间已有 LLM 标注的关系)
+        a_set, b_set = set(a_ids), set(b_ids)
+        typed_rels = []
+        allset = list(a_set | b_set)
+        if len(allset) >= 2:
+            ph = ",".join("?" * len(allset))
+            for t in c.execute(f"SELECT src,dst,rel_type,because FROM typed_edges "
+                               f"WHERE src IN ({ph}) AND dst IN ({ph})", allset + allset):
+                if (t["src"] in a_set and t["dst"] in b_set) or (t["src"] in b_set and t["dst"] in a_set):
+                    typed_rels.append({"rel": t["rel_type"], "because": t["because"]})
         res = ppr.connect_ppr(c, a_ids, b_ids, topn=5)
         res["method"] = "ppr"
+        if typed_rels:
+            res["typed_relations"] = typed_rels[:3]
         if not res.get("connected"):
             # 兜底: 语义桥 — 同时与 A 和 B 都相近的记忆 (图谱按主题聚簇时跨簇连接靠这个)
             bridges = semantic.bridge(c, a, b, k=5)
@@ -679,6 +707,43 @@ def sleep_cycle_endpoint(do_forget: int = 0, render_vault: int = 1) -> dict:
     """
     from . import sleep_cycle
     return sleep_cycle.run_sleep_cycle(do_forget=bool(do_forget), render_vault=bool(render_vault))
+
+
+class InvalidateIn(BaseModel):
+    memory_id: str
+
+
+@router.post("/invalidate")
+def invalidate_endpoint(req: InvalidateIn) -> dict:
+    """双时序: 把一条记忆标为失效 (不删, 历史仍可查). 用于口径/决策过时."""
+    now = int(time.time())
+    with _conn() as c:
+        r = c.execute("UPDATE memories SET invalid_at=? WHERE id=? AND invalid_at IS NULL",
+                      (now, req.memory_id))
+        ok = r.rowcount > 0
+    return {"status": "ok" if ok else "noop", "memory_id": req.memory_id, "invalid_at": now}
+
+
+class SupersedeIn(BaseModel):
+    old_id: str
+    new_id: str
+
+
+@router.post("/supersede")
+def supersede_endpoint(req: SupersedeIn) -> dict:
+    """双时序: 新事实取代旧事实. 旧的打 invalid_at + superseded_by=新id, 并建一条取代边."""
+    now = int(time.time())
+    with _conn() as c:
+        exists = c.execute("SELECT 1 FROM memories WHERE id=?", (req.new_id,)).fetchone()
+        if not exists:
+            return {"status": "error", "detail": "new_id 不存在"}
+        c.execute("UPDATE memories SET invalid_at=?, superseded_by=? WHERE id=?",
+                  (now, req.new_id, req.old_id))
+        # 取代边 (新 -> 旧), 便于回溯"我当时以为什么"
+        c.execute("INSERT OR REPLACE INTO edges(src,dst,weight) VALUES (?,?,?)",
+                  (req.new_id, req.old_id, 3.0))
+    ppr.invalidate_cache()
+    return {"status": "ok", "old_id": req.old_id, "new_id": req.new_id, "invalid_at": now}
 
 
 @router.get("/digest")

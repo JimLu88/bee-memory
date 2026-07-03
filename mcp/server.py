@@ -154,9 +154,14 @@ def brain_connect(a: str, b: str) -> str:
         r = _req("GET", "/memory/connect2", {"a": a, "b": b})
     except Exception as e:
         return f"关联查询失败: {e}"
+    lines = []
+    for tr in r.get("typed_relations", []):  # LLM 标注的直接关系 (最强信号)
+        lines.append(f"◆ 直接关系[{tr.get('rel')}]: {tr.get('because', '')}")
     if not r.get("connected"):
+        if lines:
+            return "\n".join(lines)
         return f"「{a}」与「{b}」在当前记忆图谱里没有找到连接路径 ({r.get('reason', '')})。"
-    lines = [f"「{a}」↔「{b}」的连接者:"]
+    lines.append(f"「{a}」↔「{b}」的连接者:")
     for conn in r.get("connectors", []):
         lines.append(f"• {conn.get('snippet', '')} (强度 {conn.get('score')}, id={conn.get('memory_id')})")
     return "\n".join(lines)
