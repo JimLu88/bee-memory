@@ -119,6 +119,9 @@ def restore_memory(memory_id: str) -> dict | None:
         available += 1
         try:
             obj = json.loads(enc.decrypt(blob).decode("utf-8"))
+            if obj.get("id") != memory_id:   # 防御: 解出的不是本记忆则跳过 (decrypt 已鉴权, 双保险)
+                last_err = "id mismatch"
+                continue
             return {"status": "ok", "available_shards": available,
                     "content": obj["content"], "memory_id": obj["id"], "from_pool": r["pool_name"]}
         except Exception as e:

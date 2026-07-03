@@ -84,3 +84,12 @@ def test_pool_names_all_resolve(db):
     from app.backup import pools as pl
     real = {p.name for p in pl.ALL_POOLS}
     assert set(coordinator.POOL_ORDER) <= real, f"POOL_ORDER 有池名不存在: {set(coordinator.POOL_ORDER)-real}"
+
+
+def test_gitee_gitlab_local_ref_detected_posix():
+    """回归 R5: gitee/gitlab 本地缓存 ref 在 Linux (POSIX 绝对路径) 也被识别为本地."""
+    from app.backup import pools as pl
+    posix_local = str(pl.CACHE_DIR / "gitee" / "sh-abc.bin")   # 形如 .../backup_cache/gitee/sh-abc.bin
+    assert pl._is_local_ref(posix_local), "CACHE_DIR 下的路径应判为本地"
+    assert pl._is_local_ref("/app/backend/data/backup_cache/gitlab/sh-x.bin"), "POSIX 绝对路径应判为本地"
+    assert not pl._is_local_ref("shards/sh-abc.b64"), "云端相对 ref 不应判为本地"

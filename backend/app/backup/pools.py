@@ -54,6 +54,14 @@ def _local_get(remote_ref: str) -> bytes | None:
     return p.read_bytes() if p.exists() else None
 
 
+def _is_local_ref(remote_ref: str) -> bool:
+    """判定是否本地缓存 ref (确定性, 与运行平台无关). 云端 ref 总是相对的 'shards/<id>.b64';
+    本地 ref = str(CACHE_DIR/...): Linux 上 POSIX 绝对路径(以 '/' 开头), Windows 上含盘符 ':' 或 '\\'."""
+    return (remote_ref.startswith(str(CACHE_DIR))
+            or remote_ref.startswith("/")     # POSIX 绝对路径 (Linux 部署), 不依赖运行平台
+            or "\\" in remote_ref or ":" in remote_ref)
+
+
 class GistPool:
     name = "gist"
 
@@ -309,8 +317,8 @@ class GiteePool:
         return _local_put(self.name, shard_id, blob)
 
     def get(self, remote_ref: str) -> bytes | None:
-        # 本地缓存 ref: Windows 绝对路径 (含 "\\" 或盘符 ":")
-        if "\\" in remote_ref or ":" in remote_ref:
+        # 本地缓存 ref (平台无关: Windows 盘符 / Linux POSIX 绝对路径 / CACHE_DIR 前缀)
+        if _is_local_ref(remote_ref):
             local = _local_get(remote_ref)
             if local is not None:
                 return local
@@ -396,8 +404,8 @@ class GitLabPool:
         return _local_put(self.name, shard_id, blob)
 
     def get(self, remote_ref: str) -> bytes | None:
-        # 本地缓存 ref: Windows 绝对路径 (含 "\\" 或盘符 ":")
-        if "\\" in remote_ref or ":" in remote_ref:
+        # 本地缓存 ref (平台无关: Windows 盘符 / Linux POSIX 绝对路径 / CACHE_DIR 前缀)
+        if _is_local_ref(remote_ref):
             local = _local_get(remote_ref)
             if local is not None:
                 return local
