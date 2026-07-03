@@ -241,11 +241,16 @@ def test_due_excludes_invalid(db):
 def test_sleep_cycle_lock_skips_second(db, monkeypatch, tmp_path):
     """回归 R2#7: 已持锁时第二次 run_sleep_cycle 直接跳过."""
     monkeypatch.setattr(llm, "available", lambda: False)
-    lock = sleep_cycle._acquire_lock()
-    assert lock is not None
+    acq = sleep_cycle._acquire_lock()
+    assert acq is not None
+    lock, token = acq
     r2 = sleep_cycle.run_sleep_cycle()  # 锁被占
     assert r2["status"] == "skipped_already_running"
-    lock.unlink()
+    # 别人的锁不被误删: 用错 token 释放不删
+    sleep_cycle._release_lock(lock, "wrong-token")
+    assert lock.exists()
+    sleep_cycle._release_lock(lock, token)
+    assert not lock.exists()
 
 
 def test_stability_uses_review_state(db):
