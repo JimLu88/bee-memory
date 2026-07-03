@@ -14,6 +14,7 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 from app import associative, llm, memory, ppr, semantic, sleep_cycle  # noqa: E402
+from app import spaced_repetition  # noqa: E402
 
 
 def _fake_vec(text, timeout=None, dim=1024):
@@ -31,7 +32,7 @@ def _fake_vec(text, timeout=None, dim=1024):
 @pytest.fixture()
 def db(tmp_path, monkeypatch):
     p = tmp_path / "m.sqlite"
-    for mod in (memory, associative, semantic, ppr):
+    for mod in (memory, associative, semantic, ppr, spaced_repetition):
         monkeypatch.setattr(mod, "DB_PATH", p)
     monkeypatch.setattr(semantic, "embed_text", _fake_vec)
     monkeypatch.setattr(semantic, "embed_batch", lambda ts: [_fake_vec(t) for t in ts])
@@ -181,6 +182,70 @@ def test_forget_cleans_typed_edges(db, monkeypatch):
     forget(ForgetIn(memory_id=a, force=True))
     with memory._conn() as c:
         assert c.execute("SELECT COUNT(*) FROM typed_edges WHERE src=? OR dst=?", (a, a)).fetchone()[0] == 0
+
+
+def test_load_matrix_dim_guard(db):
+    """回归 R2#1: memories_vec 混维时 vector_search 不该崩溃 (跳过异维行)."""
+    _store("semantic", "定价正常向量记忆")
+    import struct
+    with memory._conn() as c:  # 塞一条错维向量 (512)
+        bad = struct.pack("512f", *([0.1] * 512))
+        c.execute("INSERT OR REPLACE INTO memories_vec(memory_id,dim,vec,embedded_ts) VALUES ('m-bad',512,?,0)", (bad,))
+    semantic.invalidate_cache()
+    with memory._conn() as c:
+        hits = semantic.vector_search(c, "定价", k=3)  # 不抛异常
+    assert isinstance(hits, list)
+
+
+def test_relation_search_reads_embedding(db):
+    """回归 R2#5: typed_edges.because 向量能被语义检索 (关系可检索)."""
+    import struct
+    emb = _fake_vec("定价系数导致弹窗失效")
+    eb = struct.pack(f"{len(emb)}f", *emb)
+    with memory._conn() as c:
+        c.execute("INSERT INTO typed_edges(id,src,dst,rel_type,because,weight,embedding,created_ts) "
+                  "VALUES ('te-1','a','b','causes','定价系数导致弹窗失效',2.0,?,0)", (eb,))
+    with memory._conn() as c:
+        hits = associative.relation_search(c, "定价系数导致弹窗失效", k=3, min_sim=0.5)
+    assert hits and hits[0]["rel"] == "causes"
+
+
+def test_invalidate_cleans_review_and_cooccur(db):
+    """回归 R2#2/#8: invalidate 立即退复习闸 + 摘共现边."""
+    mid = _store("semantic", "会失效的重要知识 关联甲", importance=5)  # 自动入复习闸
+    _store("semantic", "关联甲 的另一条")
+    associative.reindex_concepts(rebuild_edges=True)
+    with memory._conn() as c:
+        assert c.execute("SELECT COUNT(*) FROM review_state WHERE memory_id=?", (mid,)).fetchone()[0] == 1
+    from app.associative import InvalidateIn, invalidate_endpoint
+    invalidate_endpoint(InvalidateIn(memory_id=mid))
+    with memory._conn() as c:
+        assert c.execute("SELECT COUNT(*) FROM review_state WHERE memory_id=?", (mid,)).fetchone()[0] == 0
+        assert c.execute("SELECT COUNT(*) FROM edges WHERE (src=? OR dst=?) AND kind='cooccur'",
+                         (mid, mid)).fetchone()[0] == 0
+
+
+def test_due_excludes_invalid(db):
+    """回归 R2#2: 失效记忆不再出现在复习队列."""
+    import time as _t
+    mid = _store("semantic", "重要待复习", importance=5)
+    with memory._conn() as c:
+        c.execute("UPDATE review_state SET next_review_ts=? WHERE memory_id=?", (int(_t.time()) - 10, mid))
+    from app.spaced_repetition import due
+    assert mid in [it["id"] for it in due(limit=20)["items"]]
+    from app.associative import InvalidateIn, invalidate_endpoint
+    invalidate_endpoint(InvalidateIn(memory_id=mid))
+    assert mid not in [it["id"] for it in due(limit=20)["items"]]
+
+
+def test_sleep_cycle_lock_skips_second(db, monkeypatch, tmp_path):
+    """回归 R2#7: 已持锁时第二次 run_sleep_cycle 直接跳过."""
+    monkeypatch.setattr(llm, "available", lambda: False)
+    lock = sleep_cycle._acquire_lock()
+    assert lock is not None
+    r2 = sleep_cycle.run_sleep_cycle()  # 锁被占
+    assert r2["status"] == "skipped_already_running"
+    lock.unlink()
 
 
 def test_stability_uses_review_state(db):

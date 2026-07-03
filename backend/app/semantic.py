@@ -149,8 +149,11 @@ def _load_matrix(c: sqlite3.Connection) -> tuple[list[str], np.ndarray]:
     ids: list[str] = []
     vecs: list[np.ndarray] = []
     for mid, dim, blob in c.execute("SELECT memory_id, dim, vec FROM memories_vec"):
+        v = _unpack(blob, dim)
+        if v.shape[0] != EMBED_DIM:   # 维度守卫: 混维(换模型/残留/损坏)不进矩阵, 否则 vstack 崩溃拖垮全检索
+            continue
         ids.append(mid)
-        vecs.append(_unpack(blob, dim))
+        vecs.append(v)
     mat = np.vstack(vecs) if vecs else np.zeros((0, EMBED_DIM), dtype=np.float32)
     _CACHE.update({"n": n, "ids": ids, "mat": mat, "ts": time.time()})
     return ids, mat

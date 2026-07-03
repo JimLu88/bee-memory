@@ -385,23 +385,53 @@ def _backup() -> dict[str, Any]:
             "kept": min(len(files), BACKUP_KEEP), "suspicious": suspicious}
 
 
+def _acquire_lock() -> Path | None:
+    """单实例锁 (防两次睡眠循环重叠致重复蒸馏/MOC). 拿到返回锁路径, 拿不到返回 None.
+    陈旧锁 (>2h, 大概率是崩溃残留) 自动接管."""
+    from .memory import DB_PATH
+    lock = Path(DB_PATH).parent / ".sleep_cycle.lock"
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(int(time.time())).encode())
+        os.close(fd)
+        return lock
+    except FileExistsError:
+        try:
+            ts = int(lock.read_text().strip() or "0")
+            if time.time() - ts < 7200:
+                return None  # 有活跃锁, 让出
+            lock.unlink()    # 陈旧, 接管
+            return _acquire_lock()
+        except Exception:
+            return None
+
+
 def run_sleep_cycle(do_forget: bool = False, render_vault: bool = True) -> dict[str, Any]:
-    """完整睡眠循环. do_forget=False 时只报告遗忘候选不删 (安全默认)."""
+    """完整睡眠循环. do_forget=False 时只报告遗忘候选不删 (安全默认). 单实例串行."""
+    lock = _acquire_lock()
+    if lock is None:
+        return {"status": "skipped_already_running"}
     from .memory import _conn, consolidate, forget, ForgetIn
     t0 = time.time()
     out: dict[str, Any] = {}
-    out["distill"] = _distill_episodics()         # 0a 经验固化 episodic→semantic (LLM, 自管短事务)
-    out["consolidate"] = consolidate()            # 1+3 reindex + dangling promote
-    out["typed_edges"] = _typed_edges()           # 0b 类型化边 (LLM, 自管短事务)
-    out["backfill"] = semantic.backfill()         # 2 补嵌入
-    with _conn() as c:
-        out["stability_updated"] = _update_stability(c)  # 4
-        out["mocs"] = _generate_mocs(c)                  # 5
-    if render_vault:
+    try:
+        out["distill"] = _distill_episodics()         # 0a 经验固化 episodic→semantic (LLM, 自管短事务)
+        out["consolidate"] = consolidate()            # 1+3 reindex + dangling promote
+        out["typed_edges"] = _typed_edges()           # 0b 类型化边 (LLM, 自管短事务)
+        out["backfill"] = semantic.backfill()         # 2 补嵌入
         with _conn() as c:
-            out["vault"] = _render_vault(c)              # 6
-    out["forget"] = forget(ForgetIn(below_activation=0.05, dry_run=not do_forget, max_delete=100))  # 7
-    out["backup"] = _backup()                                                                       # 8 快照
-    out["status"] = "ok"
-    out["elapsed_s"] = round(time.time() - t0, 1)
+            out["stability_updated"] = _update_stability(c)  # 4
+            out["mocs"] = _generate_mocs(c)                  # 5
+        if render_vault:
+            with _conn() as c:
+                out["vault"] = _render_vault(c)              # 6
+        out["forget"] = forget(ForgetIn(below_activation=0.05, dry_run=not do_forget, max_delete=100))  # 7
+        out["backup"] = _backup()                                                                       # 8 快照
+        out["status"] = "ok"
+        out["elapsed_s"] = round(time.time() - t0, 1)
+    finally:
+        try:
+            lock.unlink()
+        except Exception:
+            pass
     return out

@@ -359,9 +359,15 @@ def reindex_concepts(rebuild_edges: bool = True, limit: int = 0) -> dict[str, An
                         deg[s] += 1
                         edge_count += 1
             stats["cooccur_edges"] = edge_count
-            # 更新 connection_density (与 memory.add_edge 同公式)
+            # 全量重算 connection_density (含 provenance/supersede 边): 先清零, 再按当前全部边计数.
+            # 否则丢了边的记忆保留陈旧 density → 被幽灵边永久保护/加权, 随月劣化.
             import math
-            for node, cnt in deg.items():
+            c.execute("UPDATE memories SET connection_density=0")
+            total_deg: dict[str, int] = defaultdict(int)
+            for s, d in c.execute("SELECT src, dst FROM edges"):
+                total_deg[s] += 1
+                total_deg[d] += 1
+            for node, cnt in total_deg.items():
                 c.execute("UPDATE memories SET connection_density=? WHERE id=?",
                           (math.log1p(cnt) / 5.0, node))
 
@@ -649,6 +655,39 @@ def recall_hybrid_endpoint(query: str, k: int = 8, persona_id: str = "", kind: s
                          compact=bool(compact), boost_mode=boost_mode)
 
 
+def relation_search(c, query: str, k: int = 5, min_sim: float = 0.4) -> list[dict]:
+    """P2 关系可检索 (LightRAG 双层): 对 typed_edges 的 because 向量做语义检索, 直接召回"关系"本身.
+    回答"睡眠和情绪的关联"这类问题 — 不必绕道两个端点, 关系边自己就能被查到."""
+    import struct
+
+    import numpy as np
+    qv = semantic.embed_query(query)
+    if qv is None:
+        return []
+    q = np.asarray(qv, dtype=np.float32)
+    out = []
+    for rel_type, because, emb in c.execute(
+            "SELECT rel_type, because, embedding FROM typed_edges WHERE embedding IS NOT NULL"):
+        try:
+            ev = np.frombuffer(emb, dtype=np.float32)
+        except Exception:
+            continue
+        if ev.shape[0] != semantic.EMBED_DIM:
+            continue
+        sim = float(ev @ q)
+        if sim >= min_sim:
+            out.append((sim, rel_type, because))
+    out.sort(reverse=True)
+    return [{"rel": rt, "because": bc, "sim": round(s, 3)} for s, rt, bc in out[:k]]
+
+
+@router.get("/relations")
+def relations_endpoint(query: str, k: int = 5) -> dict:
+    """按语义检索类型化关系 (读 because 向量). 直接回答'X 和 Y 有什么关联'类问题."""
+    with _conn() as c:
+        return {"items": relation_search(c, query, k=k)}
+
+
 def _rich_seeds(c, query: str, k: int = 12) -> list[str]:
     """连接用的种子: 语义(向量) + 字面 并集, 排除失效记忆. 比纯 LIKE 更可能命中有边的节点."""
     vec = [m for m, _ in semantic.vector_search(c, query, k=k)]
@@ -678,6 +717,12 @@ def connect_ppr_endpoint(a: str, b: str, k: int = 12) -> dict:
                                f"WHERE src IN ({ph}) AND dst IN ({ph})", allset + allset):
                 if (t["src"] in a_set and t["dst"] in b_set) or (t["src"] in b_set and t["dst"] in a_set):
                     typed_rels.append({"rel": t["rel_type"], "because": t["because"]})
+        # 语义关系检索 (读 because 向量): A/B 记忆不直接相邻也能召回相关关系
+        seen_because = {tr["because"] for tr in typed_rels}
+        for rel in relation_search(c, f"{a} {b}", k=3):
+            if rel["because"] not in seen_because:
+                typed_rels.append({"rel": rel["rel"], "because": rel["because"]})
+                seen_because.add(rel["because"])
         res = ppr.connect_ppr(c, a_ids, b_ids, topn=5)
         res["method"] = "ppr"
         if typed_rels:
@@ -688,6 +733,8 @@ def connect_ppr_endpoint(a: str, b: str, k: int = 12) -> dict:
             if bridges:
                 res = {"connected": True, "method": "semantic_bridge",
                        "connectors": [{"memory_id": m, "score": round(s, 4)} for m, s in bridges]}
+                if typed_rels:  # 别把最强信号(LLM标注的直接关系)在回退时丢掉
+                    res["typed_relations"] = typed_rels[:3]
         if res.get("connected"):
             for conn in res["connectors"]:
                 row = c.execute("SELECT content FROM memories WHERE id=?", (conn["memory_id"],)).fetchone()
@@ -736,6 +783,12 @@ def invalidate_endpoint(req: InvalidateIn) -> dict:
         r = c.execute("UPDATE memories SET invalid_at=? WHERE id=? AND invalid_at IS NULL",
                       (now, req.memory_id))
         ok = r.rowcount > 0
+        if ok:  # 立即退出复习闸 + 从共现图摘除 (不等下次 reindex 才干净)
+            c.execute("DELETE FROM review_state WHERE memory_id=?", (req.memory_id,))
+            c.execute("DELETE FROM edges WHERE (src=? OR dst=?) AND (kind='cooccur' OR kind IS NULL)",
+                      (req.memory_id, req.memory_id))
+    if ok:
+        ppr.invalidate_cache()
     return {"status": "ok" if ok else "noop", "memory_id": req.memory_id, "invalid_at": now}
 
 
@@ -754,6 +807,10 @@ def supersede_endpoint(req: SupersedeIn) -> dict:
             return {"status": "error", "detail": "new_id 不存在"}
         c.execute("UPDATE memories SET invalid_at=?, superseded_by=? WHERE id=?",
                   (now, req.new_id, req.old_id))
+        # 旧的立即退出复习闸 + 摘除共现边 (取代边保留)
+        c.execute("DELETE FROM review_state WHERE memory_id=?", (req.old_id,))
+        c.execute("DELETE FROM edges WHERE (src=? OR dst=?) AND (kind='cooccur' OR kind IS NULL)",
+                  (req.old_id, req.old_id))
         # 取代边 (新 -> 旧, kind=supersede 不被 reindex 清), 便于回溯"我当时以为什么"
         c.execute("INSERT OR REPLACE INTO edges(src,dst,weight,kind) VALUES (?,?,?,'supersede')",
                   (req.new_id, req.old_id, 3.0))

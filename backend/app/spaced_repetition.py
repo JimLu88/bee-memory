@@ -53,7 +53,7 @@ def due(limit: int = 20) -> dict:
                       r.ef, r.interval_days, r.repetitions, r.next_review_ts
                  FROM memories m
                  JOIN review_state r ON m.id = r.memory_id
-                WHERE r.next_review_ts <= ?
+                WHERE r.next_review_ts <= ? AND m.invalid_at IS NULL
              ORDER BY r.next_review_ts ASC
                 LIMIT ?""",
             (now, limit),
