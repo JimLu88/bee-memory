@@ -108,19 +108,23 @@ def restore_memory(memory_id: str) -> dict | None:
         ).fetchall()
     if not rows:
         return None
-    # 复制式冗余: 每片=完整密文, 任一份存活即可恢复 (needed=1)
-    shards: list[bytes | None] = [pl.by_name(r["pool_name"]).get(r["remote_ref"]) for r in rows[:5]]
-    available = sum(1 for s in shards if s is not None)
-    if available < rs.K:
-        return {"status": "failed", "available_shards": available, "needed": rs.K}
-    try:
-        ciphertext = rs.reassemble(shards)
-        plaintext = enc.decrypt(ciphertext)
-        obj = json.loads(plaintext.decode("utf-8"))
-    except Exception as e:  # 重建/解密失败绝不 500, 返回可读失败
-        return {"status": "failed", "available_shards": available, "error": repr(e)[:200]}
-    return {"status": "ok", "available_shards": available,
-            "content": obj["content"], "memory_id": obj["id"]}
+    # 复制式冗余: 每片=完整密文. 逐份尝试解密, 返回第一份能解密成功的
+    # (某池返回错内容/坏token的拷贝会被跳过, 只要有一份好的就能恢复).
+    available = 0
+    last_err = ""
+    for r in rows:
+        blob = pl.by_name(r["pool_name"]).get(r["remote_ref"])
+        if not blob:
+            continue
+        available += 1
+        try:
+            obj = json.loads(enc.decrypt(blob).decode("utf-8"))
+            return {"status": "ok", "available_shards": available,
+                    "content": obj["content"], "memory_id": obj["id"], "from_pool": r["pool_name"]}
+        except Exception as e:
+            last_err = repr(e)[:150]
+            continue
+    return {"status": "failed", "available_shards": available, "error": last_err or "no shard available"}
 
 
 def retry_pending(limit: int = 50) -> dict:
