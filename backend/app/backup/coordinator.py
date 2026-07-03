@@ -13,7 +13,9 @@ from pathlib import Path
 from . import reed_solomon as rs, encryption as enc, pools as pl
 
 DB_PATH = Path(__file__).parent.parent.parent / "data" / "memories.sqlite"
-POOL_ORDER = ["gist", "r2", "notion", "aliyun", "gdrive"]
+# 池名必须与 pools.ALL_POOLS 一致 (v8/v9-CN 已把 r2/aliyun/gdrive 换成 webdav/gitee/gitlab).
+# 旧名会让 pl.by_name() 抛 KeyError → 每次备份全崩且被误报 404. 复审 R4 critical.
+POOL_ORDER = ["gist", "webdav", "notion", "gitee", "gitlab"]
 
 
 def _conn() -> sqlite3.Connection:
@@ -41,8 +43,13 @@ def _tier(importance: int, age_days: float) -> list[str]:
     if importance >= 3:
         return POOL_ORDER
     if importance >= 2:
-        return ["gist", "r2", "notion"]
-    return ["gist", "r2"]
+        return ["gist", "webdav", "notion"]
+    return ["gist", "webdav"]
+
+
+def memory_exists(memory_id: str) -> bool:
+    with _conn() as c:
+        return c.execute("SELECT 1 FROM memories WHERE id=?", (memory_id,)).fetchone() is not None
 
 
 def backup_memory(memory_id: str) -> dict:
@@ -101,14 +108,17 @@ def restore_memory(memory_id: str) -> dict | None:
         ).fetchall()
     if not rows:
         return None
-    # reassemble 按分片内嵌 index 归位, 列表顺序无所谓; 拉全部 (最多 5) 交给它
+    # 复制式冗余: 每片=完整密文, 任一份存活即可恢复 (needed=1)
     shards: list[bytes | None] = [pl.by_name(r["pool_name"]).get(r["remote_ref"]) for r in rows[:5]]
     available = sum(1 for s in shards if s is not None)
-    if available < 3:
-        return {"status": "failed", "available_shards": available, "needed": 3}
-    ciphertext = rs.reassemble(shards)
-    plaintext = enc.decrypt(ciphertext)
-    obj = json.loads(plaintext.decode("utf-8"))
+    if available < rs.K:
+        return {"status": "failed", "available_shards": available, "needed": rs.K}
+    try:
+        ciphertext = rs.reassemble(shards)
+        plaintext = enc.decrypt(ciphertext)
+        obj = json.loads(plaintext.decode("utf-8"))
+    except Exception as e:  # 重建/解密失败绝不 500, 返回可读失败
+        return {"status": "failed", "available_shards": available, "error": repr(e)[:200]}
     return {"status": "ok", "available_shards": available,
             "content": obj["content"], "memory_id": obj["id"]}
 

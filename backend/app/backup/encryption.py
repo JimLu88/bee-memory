@@ -5,10 +5,11 @@ HMAC-SHA256 keystream + HMAC tag 的零依赖方案。
 """
 from __future__ import annotations
 
-import os, hmac, hashlib, secrets
+import os, hmac, hashlib, secrets, logging
 from pathlib import Path
 
 KEY_PATH = Path(__file__).parent.parent.parent / "data" / ".backup_key"
+_log = logging.getLogger("bee.backup")
 
 
 def _ensure_key() -> bytes:
@@ -21,6 +22,9 @@ def _ensure_key() -> bytes:
         os.chmod(KEY_PATH, 0o600)
     except OSError:
         pass
+    # 关键告警: 密钥丢失=所有云端密文永久无法解密. 新生成时大声提示务必单独异地备份此文件.
+    _log.warning("[bee-backup] 新生成备份主密钥 %s — 这是所有云端备份的唯一解密钥, "
+                 "请立即单独异地备份此文件; 丢失=所有备份永久不可恢复!", KEY_PATH)
     return key
 
 

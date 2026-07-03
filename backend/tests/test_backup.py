@@ -65,3 +65,22 @@ def test_restore_roundtrip_after_rebackup(db):
 
 def test_restore_none_when_absent(db):
     assert coordinator.restore_memory("m-nonexistent") is None
+
+
+def test_restore_survives_4_of_5_lost(db):
+    """复制式冗余: 5 池丢 4 (只剩 1 份) 仍能完整恢复."""
+    mid = _store("只剩一份也能恢复独有丙")
+    coordinator.backup_memory(mid)
+    with coordinator._conn() as c:
+        keep = c.execute("SELECT shard_id FROM backup_shards WHERE memory_id=? LIMIT 1", (mid,)).fetchone()[0]
+        c.execute("DELETE FROM backup_shards WHERE memory_id=? AND shard_id!=?", (mid, keep))
+        assert c.execute("SELECT COUNT(*) FROM backup_shards WHERE memory_id=?", (mid,)).fetchone()[0] == 1
+    r = coordinator.restore_memory(mid)
+    assert r and r["status"] == "ok" and r["content"] == "只剩一份也能恢复独有丙"
+
+
+def test_pool_names_all_resolve(db):
+    """回归 R4 critical: POOL_ORDER 里每个池名都能被 pl.by_name 解析 (不再 KeyError)."""
+    from app.backup import pools as pl
+    real = {p.name for p in pl.ALL_POOLS}
+    assert set(coordinator.POOL_ORDER) <= real, f"POOL_ORDER 有池名不存在: {set(coordinator.POOL_ORDER)-real}"

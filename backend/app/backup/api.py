@@ -14,10 +14,12 @@ router = APIRouter()
 
 @router.post("/run/{memory_id}")
 def run(memory_id: str) -> dict:
+    if not coord.memory_exists(memory_id):
+        raise HTTPException(404, f"memory {memory_id} 不存在")
     try:
         return coord.backup_memory(memory_id)
-    except KeyError:
-        raise HTTPException(404, f"memory {memory_id} 不存在")
+    except Exception as e:  # 记忆存在却失败 = 真错误 (如池配置), 别再误报 404
+        raise HTTPException(500, f"backup failed: {e!r}")
 
 
 @router.get("/restore/{memory_id}")
