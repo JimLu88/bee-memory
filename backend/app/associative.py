@@ -539,7 +539,7 @@ def _title_snippet(content: str) -> tuple[str, str]:
 
 
 def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
-                  compact: bool = True, boost_mode: str = "") -> dict[str, Any]:
+                  compact: bool = True, boost_mode: str = "", personal: bool = False) -> dict[str, Any]:
     """向量(语义)+FTS(字面) 找入口 → 个性化 PageRank 沿共现边扩散 → 综合排序.
 
     综合分 = 0.5*语义相似 + 0.3*PPR扩散(归一) + 0.2*激活分(归一). 这一步负责"问A召回B".
@@ -560,6 +560,12 @@ def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
             allowed = {r[0] for r in c.execute(f"SELECT id FROM memories WHERE {' AND '.join(w)}", p)}
             if not allowed:
                 return {"items": [], "note": "persona/kind 无匹配"}
+        # personal: 只在"用户自己的记忆"里找 (排除蜂群 persona 书本/法规知识), 否则被 12k 书淹没
+        if personal and allowed is None:
+            personal_ids = {r[0] for r in c.execute(
+                "SELECT id FROM memories WHERE kind IN ('episodic','semantic','procedural') AND invalid_at IS NULL")}
+            if personal_ids:
+                allowed = personal_ids
 
         # 入口: 向量 topN + FTS topN
         vec_hits = semantic.vector_search(c, query, k=max(30, k * 4), candidate_ids=allowed)
@@ -650,10 +656,11 @@ def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
 
 @router.get("/recall-hybrid")
 def recall_hybrid_endpoint(query: str, k: int = 8, persona_id: str = "", kind: str = "",
-                           compact: int = 1, boost_mode: str = "") -> dict:
-    """P1 混合检索端点 (语义+字面+关联扩散). 默认紧凑返回 (省 token). boost_mode=同项目提分."""
+                           compact: int = 1, boost_mode: str = "", personal: int = 0) -> dict:
+    """P1 混合检索端点 (语义+字面+关联扩散). 默认紧凑返回 (省 token). boost_mode=同项目提分.
+    personal=1: 只在用户自己的记忆里找 (排除蜂群 persona 书本知识)."""
     return hybrid_recall(query, k=k, persona_id=persona_id, kind=kind,
-                         compact=bool(compact), boost_mode=boost_mode)
+                         compact=bool(compact), boost_mode=boost_mode, personal=bool(personal))
 
 
 def relation_search(c, query: str, k: int = 5, min_sim: float = 0.4) -> list[dict]:
@@ -689,25 +696,27 @@ def relations_endpoint(query: str, k: int = 5) -> dict:
         return {"items": relation_search(c, query, k=k)}
 
 
-def _rich_seeds(c, query: str, k: int = 12) -> list[str]:
-    """连接用的种子: 语义(向量) + 字面 并集, 排除失效记忆. 比纯 LIKE 更可能命中有边的节点."""
-    vec = [m for m, _ in semantic.vector_search(c, query, k=k)]
+def _rich_seeds(c, query: str, k: int = 12, personal: bool = False) -> list[str]:
+    """连接用的种子: 语义(向量) + 字面 并集, 排除失效记忆. 比纯 LIKE 更可能命中有边的节点.
+    personal=True 时只取用户自己的记忆 (排除蜂群书本知识)."""
+    vec = [m for m, _ in semantic.vector_search(c, query, k=k * 3 if personal else k)]
     seeds = list(dict.fromkeys(vec + entry_search(c, query, k)))
     if not seeds:
         return seeds
     ph = ",".join("?" * len(seeds))
+    kb = "AND kind IN ('episodic','semantic','procedural')" if personal else ""
     valid = {r[0] for r in c.execute(
-        f"SELECT id FROM memories WHERE id IN ({ph}) AND invalid_at IS NULL", seeds)}
-    return [s for s in seeds if s in valid]
+        f"SELECT id FROM memories WHERE id IN ({ph}) AND invalid_at IS NULL {kb}", seeds)}
+    return [s for s in seeds if s in valid][:k]
 
 
 @router.get("/connect2")
-def connect_ppr_endpoint(a: str, b: str, k: int = 12) -> dict:
-    """P1 双端 PPR 找连接者 (比 BFS 鲁棒): 回答 'A 和 B 有什么关系'."""
+def connect_ppr_endpoint(a: str, b: str, k: int = 12, personal: int = 1) -> dict:
+    """P1 双端 PPR 找连接者 (比 BFS 鲁棒): 回答 'A 和 B 有什么关系'. personal=1 只连用户自己的记忆."""
     with _conn() as c:
         c.row_factory = sqlite3.Row
-        a_ids = _rich_seeds(c, a, k)
-        b_ids = _rich_seeds(c, b, k)
+        a_ids = _rich_seeds(c, a, k, personal=bool(personal))
+        b_ids = _rich_seeds(c, b, k, personal=bool(personal))
         # 直接类型化关系 (最强信号: A 侧记忆与 B 侧记忆之间已有 LLM 标注的关系)
         a_set, b_set = set(a_ids), set(b_ids)
         typed_rels = []
@@ -820,7 +829,7 @@ def supersede_endpoint(req: SupersedeIn) -> dict:
 
 
 @router.get("/digest")
-def digest_endpoint(project: str = "", limit: int = 8) -> dict:
+def digest_endpoint(project: str = "", limit: int = 8, personal: int = 1) -> dict:
     """P2 会话启动摘要 (硬顶极小 token): 统计 + top 重要记忆一句话.
 
     project 给定时优先召回该项目相关记忆; 否则给全局最重要/最新的.
@@ -838,11 +847,14 @@ def digest_endpoint(project: str = "", limit: int = 8) -> dict:
         }
         top = []
         if project:
-            top = hybrid_recall(project, k=limit, compact=True).get("items", [])
+            top = hybrid_recall(project, k=limit, compact=True, personal=bool(personal)).get("items", [])
         if not top:
+            # personal 默认排除蜂群 persona 书本/法规, 只显示用户自己的记忆
+            kb_filter = "AND kind IN ('episodic','semantic','procedural')" if personal else ""
             rows = c.execute(
                 "SELECT id, content, kind, importance, token_count FROM memories "
-                "WHERE invalid_at IS NULL ORDER BY importance DESC, last_recall_ts DESC LIMIT ?", (limit,)).fetchall()
+                f"WHERE invalid_at IS NULL {kb_filter} ORDER BY importance DESC, last_recall_ts DESC LIMIT ?",
+                (limit,)).fetchall()
             for r in rows:
                 title, snip = _title_snippet(r["content"])
                 top.append({"id": r["id"], "title": title, "snippet": snip,

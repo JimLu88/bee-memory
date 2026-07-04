@@ -95,7 +95,8 @@ def brain_recall(query: str, k: int = 8, project: str = "") -> str:
     if g:
         return g
     try:
-        params = {"query": query, "k": k, "compact": 1}
+        # personal=1: 只在"你自己的记忆"里找 (拍板/踩坑/口径/项目事实), 排除蜂群 persona 书本知识
+        params = {"query": query, "k": k, "compact": 1, "personal": 1}
         if project:
             params["boost_mode"] = project
         r = _req("GET", "/memory/recall-hybrid", params)

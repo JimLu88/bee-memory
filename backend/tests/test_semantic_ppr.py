@@ -163,6 +163,19 @@ def test_hard_delete_cleans_vector(db):
         assert c.execute("SELECT COUNT(*) FROM memories_vec WHERE memory_id=?", (mid,)).fetchone()[0] == 0
 
 
+def test_personal_scope_excludes_persona_books(db):
+    """personal=True 只回用户自己的记忆 (episodic/semantic/procedural), 排除蜂群 persona 书本知识."""
+    from app.memory import StoreRequest, store
+    store(StoreRequest(kind="knowledge_book", content="某本定价学书本内容"))
+    mine = store(StoreRequest(kind="episodic", content="我拍板定价改倒推系数"))["memory_id"]
+    associative.reindex_concepts(rebuild_edges=True)
+    res = associative.hybrid_recall("定价", k=5, personal=True)
+    ids = [it["id"] for it in res["items"]]
+    kinds = [it["kind"] for it in res["items"]]
+    assert mine in ids, "个人记忆应召回"
+    assert all(not str(k).startswith("knowledge_") for k in kinds), "personal 模式不应回书本知识"
+
+
 def test_backfill_embeds_missing(db):
     with memory._conn() as c:
         import time as _t
