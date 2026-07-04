@@ -21,7 +21,7 @@ import uuid as _uuid
 from pathlib import Path
 from typing import Any
 
-from . import associative, llm, semantic
+from . import associative, file_memory_sync, llm, semantic
 
 VAULT_DIR = Path(os.environ.get("BEE_VAULT_DIR", r"D:/AI/AI 记忆中心/vault"))
 BACKUP_DIR = Path(os.environ.get("BEE_BACKUP_DIR", r"D:/AI/AI 记忆中心/backups"))
@@ -431,6 +431,7 @@ def run_sleep_cycle(do_forget: bool = False, render_vault: bool = True) -> dict[
     t0 = time.time()
     out: dict[str, Any] = {}
     try:
+        out["file_sync"] = file_memory_sync.sync_file_memories()  # 0. 自动同步文件记忆进大脑 (用户无需手动)
         out["distill"] = _distill_episodics()         # 0a 经验固化 episodic→semantic (LLM, 自管短事务)
         out["consolidate"] = consolidate()            # 1+3 reindex + dangling promote
         out["typed_edges"] = _typed_edges()           # 0b 类型化边 (LLM, 自管短事务)

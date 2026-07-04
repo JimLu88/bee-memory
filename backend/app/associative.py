@@ -771,6 +771,13 @@ def vec_stats_endpoint() -> dict:
     return semantic.stats()
 
 
+@router.post("/sync-file-memories")
+def sync_file_memories_endpoint() -> dict:
+    """把 Claude 记忆文件 (~/.claude/.../memory/*.md) 幂等同步进大脑 (夜间循环自动跑, 也可手动触发)."""
+    from . import file_memory_sync
+    return file_memory_sync.sync_file_memories()
+
+
 @router.post("/sleep-cycle")
 def sleep_cycle_endpoint(do_forget: int = 0, render_vault: int = 1) -> dict:
     """P3 睡眠循环: reindex+补嵌入+dangling提升+stability+MOC+vault渲染+遗忘(默认dry_run).

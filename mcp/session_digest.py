@@ -44,12 +44,26 @@ def _spawn_service() -> None:
         pass
 
 
+def _spawn_sync() -> None:
+    """后台触发文件记忆同步 (fire-and-forget, 不阻塞会话启动). 让新写的记忆文件自动进大脑."""
+    try:
+        creation = 0x00000008 | 0x08000000 if os.name == "nt" else 0
+        code = ("import urllib.request as u;"
+                f"u.urlopen(u.Request('{BASE}/memory/sync-file-memories',"
+                f"headers={{'Authorization':'Bearer {TOKEN}'}},method='POST'),timeout=120)")
+        subprocess.Popen([sys.executable, "-c", code], creationflags=creation,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def main() -> None:
     project = Path(os.getcwd()).name  # 钩子在项目 cwd 运行, 目录名当项目名
     if _get("/healthz", 1.5) is None:
         _spawn_service()  # 不等待, 下次工具调用时就绪
         print("🧠 记忆大脑 (claude-brain) 正在后台启动，可用 brain_recall / brain_digest 调用。")
         return
+    _spawn_sync()  # 服务在线: 后台同步文件记忆 (自动, 不阻塞)
     dg = _get("/memory/digest?project=" + urllib.parse.quote(project) + "&limit=6", 3.5)
     if not dg:
         print("🧠 记忆大脑在线。可用 brain_recall(查询) / brain_connect(A,B) / brain_store(内容)。")
