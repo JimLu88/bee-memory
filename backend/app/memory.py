@@ -1,14 +1,15 @@
 """bee-memory / 记忆中心 — 三层记忆 + 6 因子激活打分 + 宪法 (v2 阶段 3 + v3-D/E/F)"""
 from __future__ import annotations
-import sqlite3, json, time, uuid, math
+import sqlite3, json, time, uuid, math, re, threading
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 import logging
 
 from . import associative  # v4 关联层 (概念图/FTS/共现边), 纯增量
 from . import semantic      # v4 语义向量层 (bge-m3 嵌入)
+from . import cognitive     # v9 分层记忆/数字海马体 (附加表, 不改旧数据)
 
 _log = logging.getLogger("bee.memory")
 router = APIRouter()
@@ -25,49 +26,73 @@ DB_PATH = Path(__file__).parent.parent / "data" / "memories.sqlite"
 CONST_PATH = Path(__file__).parent.parent / "data" / "constitution.md"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY_FOR = ""
+_WRITE_LOCK = threading.RLock()
+
+
+def _ensure_schema_once(c: sqlite3.Connection) -> None:
+    """Initialize additive schemas once per database path and process.
+
+    SQLite still takes a schema write lock for idempotent DDL. Repeating that
+    work on every API request made large book imports contend with the
+    asynchronous retrieval writer. Normal request connections now reuse the
+    already-initialized schema.
+    """
+    global _SCHEMA_READY_FOR
+    db_key = str(DB_PATH.resolve())
+    if _SCHEMA_READY_FOR == db_key:
+        return
+    with _SCHEMA_LOCK:
+        if _SCHEMA_READY_FOR == db_key:
+            return
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                kind TEXT,
+                content TEXT,
+                mode_id TEXT,
+                importance INTEGER DEFAULT 2,
+                created_ts INTEGER,
+                last_recall_ts INTEGER,
+                recall_count INTEGER DEFAULT 0,
+                emotional_tag REAL DEFAULT 0,
+                novelty REAL DEFAULT 0.5,
+                connection_density REAL DEFAULT 0,
+                predictive_value REAL DEFAULT 0,
+                meta TEXT
+            )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_kind_ts ON memories(kind, last_recall_ts)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS edges (
+                src TEXT, dst TEXT, weight REAL DEFAULT 1.0,
+                PRIMARY KEY (src, dst)
+            )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS review_state (
+                memory_id TEXT PRIMARY KEY,
+                ef REAL DEFAULT 2.5,
+                interval_days INTEGER DEFAULT 0,
+                repetitions INTEGER DEFAULT 0,
+                next_review_ts INTEGER,
+                last_grade INTEGER
+            )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_review_due ON review_state(next_review_ts)")
+        associative.ensure_associative_schema(c)
+        semantic.ensure_vec_schema(c)
+        _migrate_add_columns(c)
+        cognitive.ensure_cognitive_schema(c)
+        _ensure_source_keys(c)
+        c.commit()
+        _SCHEMA_READY_FOR = db_key
+
 
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(str(DB_PATH), timeout=15)
-    c.execute("PRAGMA journal_mode=WAL")   # v4: 并发读写不互锁 (backfill/服务/夜间循环)
-    c.execute("PRAGMA busy_timeout=8000")  # 锁等待 8s 再报错
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS memories (
-            id TEXT PRIMARY KEY,
-            kind TEXT,                   -- episodic|semantic|procedural|self_upgrade
-            content TEXT,
-            mode_id TEXT,
-            importance INTEGER DEFAULT 2,  -- 0-5
-            created_ts INTEGER,
-            last_recall_ts INTEGER,
-            recall_count INTEGER DEFAULT 0,
-            emotional_tag REAL DEFAULT 0,   -- v3-D EmotionalTag
-            novelty REAL DEFAULT 0.5,       -- v3-D Novelty
-            connection_density REAL DEFAULT 0,
-            predictive_value REAL DEFAULT 0,
-            meta TEXT
-        )""")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_kind_ts ON memories(kind, last_recall_ts)")
-    # v3-D 边 (sender, receiver, weight) — 沿边激活扩散
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS edges (
-            src TEXT, dst TEXT, weight REAL DEFAULT 1.0,
-            PRIMARY KEY (src, dst)
-        )""")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src)")
-    # v3-F SM-2 复习状态
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS review_state (
-            memory_id TEXT PRIMARY KEY,
-            ef REAL DEFAULT 2.5,
-            interval_days INTEGER DEFAULT 0,
-            repetitions INTEGER DEFAULT 0,
-            next_review_ts INTEGER,
-            last_grade INTEGER
-        )""")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_review_due ON review_state(next_review_ts)")
-    associative.ensure_associative_schema(c)  # v4: 建关联层新表 (幂等, 不动旧表)
-    semantic.ensure_vec_schema(c)             # v4: 向量表
-    _migrate_add_columns(c)                   # v4: memories 补可空列
+    c = sqlite3.connect(str(DB_PATH), timeout=30)
+    c.execute("PRAGMA busy_timeout=30000")
+    _ensure_schema_once(c)
     return c
 
 
@@ -80,53 +105,259 @@ class StoreRequest(BaseModel):
     meta: dict = Field(default_factory=dict)
 
 
-@router.post("/store")
-def store(req: StoreRequest) -> dict:
-    mid = "m-" + uuid.uuid4().hex[:12]
-    now = int(time.time())
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO memories (id,kind,content,mode_id,importance,created_ts,last_recall_ts,emotional_tag,meta) VALUES (?,?,?,?,?,?,?,?,?)",
-            (mid, req.kind, req.content, req.mode_id, req.importance, now, now, req.emotional_tag, json.dumps(req.meta, ensure_ascii=False)),
+class BatchStoreRequest(BaseModel):
+    items: list[StoreRequest] = Field(min_length=1, max_length=500)
+
+
+def _ensure_source_keys(c: sqlite3.Connection) -> None:
+    """Create and once backfill stable source ids used by resumable imports."""
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS memory_source_keys (
+            source_id TEXT PRIMARY KEY,
+            memory_id TEXT NOT NULL
         )
-        # v4: 写入即增量索引 (概念/FTS/dangling). 失败绝不破坏 store, 但记日志 (别静默吞).
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS memory_migrations (
+            name TEXT PRIMARY KEY,
+            completed_ts INTEGER NOT NULL
+        )
+    """)
+    migrated = c.execute(
+        "SELECT 1 FROM memory_migrations WHERE name='source_keys_v1'"
+    ).fetchone()
+    if migrated:
+        return
+    for memory_id, raw_meta in c.execute(
+        "SELECT id, meta FROM memories WHERE meta IS NOT NULL AND meta != ''"
+    ).fetchall():
         try:
-            associative.index_one_memory(c, mid, req.content)
+            source_id = str((json.loads(raw_meta) or {}).get("source_id") or "").strip()
         except Exception:
-            _log.warning("index_one_memory failed for %s", mid, exc_info=True)
-        try:  # token_count (让检索结果能标 token 预算)
-            c.execute("UPDATE memories SET token_count=? WHERE id=?",
-                      (max(1, len(req.content or "") // 3), mid))
-        except Exception:
-            _log.debug("token_count update failed for %s", mid, exc_info=True)
-        try:  # 写入即嵌入 (Ollama 挂了自动降级, 不阻断 store)
+            source_id = ""
+        if source_id:
+            c.execute(
+                "INSERT OR IGNORE INTO memory_source_keys(source_id,memory_id) VALUES (?,?)",
+                (source_id, memory_id),
+            )
+    c.execute(
+        "INSERT OR REPLACE INTO memory_migrations(name,completed_ts) VALUES (?,?)",
+        ("source_keys_v1", int(time.time())),
+    )
+
+
+def _existing_source_id(c: sqlite3.Connection, req: StoreRequest) -> str:
+    source_id = str((req.meta or {}).get("source_id") or "").strip()
+    if not source_id:
+        return ""
+    row = c.execute(
+        "SELECT memory_id FROM memory_source_keys WHERE source_id=?",
+        (source_id,),
+    ).fetchone()
+    return str(row[0]) if row else ""
+
+
+def _insert_memory(
+    c: sqlite3.Connection,
+    req: StoreRequest,
+    *,
+    now: int,
+    embed_now: bool,
+    principal: dict | None = None,
+) -> tuple[str, bool]:
+    existing = _existing_source_id(c, req)
+    if existing:
+        return existing, True
+    mid = "m-" + uuid.uuid4().hex[:12]
+    c.execute(
+        "INSERT INTO memories (id,kind,content,mode_id,importance,created_ts,last_recall_ts,emotional_tag,meta) VALUES (?,?,?,?,?,?,?,?,?)",
+        (mid, req.kind, req.content, req.mode_id, req.importance, now, now, req.emotional_tag, json.dumps(req.meta, ensure_ascii=False)),
+    )
+    try:
+        tags = {str(tag).casefold() for tag in (req.meta or {}).get("tags", [])}
+        raw_book_chunk = (
+            req.kind == "knowledge_book"
+            and str((req.meta or {}).get("scope") or "") == "book_library"
+            and "full_text" in tags
+        )
+        associative.index_one_memory(
+            c,
+            mid,
+            req.content,
+            index_concepts=not raw_book_chunk,
+            replace_existing=False,
+        )
+    except Exception:
+        _log.warning("index_one_memory failed for %s", mid, exc_info=True)
+    try:
+        c.execute(
+            "UPDATE memories SET token_count=? WHERE id=?",
+            (max(1, len(req.content or "") // 3), mid),
+        )
+    except Exception:
+        _log.debug("token_count update failed for %s", mid, exc_info=True)
+    if embed_now:
+        try:
             semantic.embed_and_store(c, mid, req.content)
             semantic.invalidate_cache()
         except Exception:
             _log.warning("embed_and_store failed for %s", mid, exc_info=True)
-        try:  # v4: 重要记忆(>=4)自动入复习闸, 否则复习页永远空
-            if req.importance >= 4:
-                c.execute(
-                    "INSERT OR IGNORE INTO review_state(memory_id,ef,interval_days,repetitions,next_review_ts,last_grade) "
-                    "VALUES (?,2.5,1,0,?,NULL)", (mid, now + 86400))
-        except Exception:
-            pass
-    return {"memory_id": mid}
+    try:
+        if req.importance >= 4:
+            c.execute(
+                "INSERT OR IGNORE INTO review_state(memory_id,ef,interval_days,repetitions,next_review_ts,last_grade) "
+                "VALUES (?,2.5,1,0,?,NULL)", (mid, now + 86400),
+            )
+    except Exception:
+        pass
+    source_id = str((req.meta or {}).get("source_id") or "").strip()
+    if source_id:
+        c.execute(
+            "INSERT OR IGNORE INTO memory_source_keys(source_id,memory_id) VALUES (?,?)",
+            (source_id, mid),
+        )
+    cognitive.register_memory(c, mid, req.kind, req.meta, principal=principal)
+    return mid, False
+
+
+@router.post("/store")
+def store(req: StoreRequest, request: Request = None) -> dict:
+    now = int(time.time())
+    # SQLite only has one writer. Keep the transaction bounded and serialize
+    # API writes so timed-out import requests cannot pile up behind each other.
+    with _WRITE_LOCK:
+        c = _conn()
+        try:
+            with c:
+                mid, deduplicated = _insert_memory(
+                    c, req, now=now, embed_now=True,
+                    principal=cognitive._request_principal(request),
+                )
+        finally:
+            c.close()
+    return {"memory_id": mid, "deduplicated": deduplicated}
+
+
+@router.post("/store-batch")
+def store_batch(req: BatchStoreRequest, request: Request = None) -> dict:
+    """Store a bounded import batch in one transaction and defer embeddings."""
+    now = int(time.time())
+    ids: list[str] = []
+    deduplicated = 0
+    with _WRITE_LOCK:
+        c = _conn()
+        try:
+            with c:
+                for item in req.items:
+                    mid, existed = _insert_memory(
+                        c, item, now=now, embed_now=False,
+                        principal=cognitive._request_principal(request),
+                    )
+                    ids.append(mid)
+                    deduplicated += int(existed)
+        finally:
+            c.close()
+    semantic.invalidate_cache()
+    return {
+        "stored": len(ids) - deduplicated,
+        "deduplicated": deduplicated,
+        "memory_ids": ids,
+        "embedding_deferred": True,
+    }
 
 
 @router.get("/get")
-def get_by_id(id: str) -> dict:
+def get_by_id(id: str, request: Request = None) -> dict:
     """v4: 按 id 精确取全文 (token 金字塔 T3). brain_get / UI 看全文 用这个,
     不再走 hybrid_recall(query=id) 的近似搜索 (常miss)."""
     with _conn() as c:
+        principal = cognitive._request_principal(request)
+        if id not in cognitive._allowed_memory_ids(
+            c, principal_type=principal["principal_type"],
+            principal_id=principal["principal_id"], roles=principal["roles"],
+            candidate_ids={id},
+        ):
+            raise HTTPException(404, f"memory {id} 不存在")
         c.row_factory = sqlite3.Row
         row = c.execute("SELECT * FROM memories WHERE id=?", (id,)).fetchone()
         if not row:
             raise HTTPException(404, f"memory {id} 不存在")
-        # touch-on-recall
+        now = int(time.time())
+        before = dict(row)
+        state_before = _memory_state(before, now)
+        # touch-on-recall: 精确查询会把潜层/深层记忆重新拉回前景。
         c.execute("UPDATE memories SET recall_count=recall_count+1, last_recall_ts=? WHERE id=?",
-                  (int(time.time()), id))
-        return dict(row)
+                  (now, id))
+        after = dict(before)
+        after["recall_count"] = int(after.get("recall_count") or 0) + 1
+        after["last_recall_ts"] = now
+        after["memory_state_before"] = state_before
+        after["memory_state_after"] = _memory_state(after, now)
+        return after
+
+
+@router.get("/bundle")
+def get_bundle(bundle_id: str = Query(min_length=8, max_length=80),
+               request: Request = None) -> dict:
+    """按 bundle_id 精确重建长记忆，并重新激活组成它的全部语义块。"""
+    if not re.fullmatch(r"mb-[a-f0-9]{12,64}", bundle_id):
+        raise HTTPException(400, "bundle_id 格式不正确")
+    with _conn() as c:
+        c.row_factory = sqlite3.Row
+        candidates = c.execute(
+            "SELECT * FROM memories WHERE meta LIKE ? AND invalid_at IS NULL LIMIT 1000",
+            (f'%"bundle_id": "{bundle_id}"%',),
+        ).fetchall()
+        principal = cognitive._request_principal(request)
+        allowed_ids = cognitive._allowed_memory_ids(
+            c, principal_type=principal["principal_type"],
+            principal_id=principal["principal_id"], roles=principal["roles"],
+            candidate_ids={str(row["id"]) for row in candidates},
+        )
+        rows: list[tuple[int, dict]] = []
+        for row in candidates:
+            rd = dict(row)
+            if str(rd.get("id") or "") not in allowed_ids:
+                continue
+            try:
+                meta = json.loads(rd.get("meta") or "{}")
+            except Exception:
+                meta = {}
+            if meta.get("bundle_id") != bundle_id:
+                continue
+            rows.append((int(meta.get("chunk_index") or 0), rd))
+        if not rows:
+            return {"found": False, "bundle_id": bundle_id, "items": [], "content": ""}
+        rows.sort(key=lambda pair: pair[0])
+        now = int(time.time())
+        items = []
+        parts = []
+        for index, rd in rows:
+            state_before = _memory_state(rd, now)
+            raw = str(rd.get("content") or "")
+            try:
+                decoded = json.loads(raw)
+                part = str(decoded.get("content") or raw) if isinstance(decoded, dict) else raw
+            except Exception:
+                part = raw
+            parts.append(part)
+            items.append({
+                "id": rd["id"],
+                "chunk_index": index,
+                "memory_state_before": state_before,
+            })
+            c.execute(
+                "UPDATE memories SET recall_count=recall_count+1, last_recall_ts=? WHERE id=?",
+                (now, rd["id"]),
+            )
+        return {
+            "found": True,
+            "bundle_id": bundle_id,
+            "items": items,
+            "content": "".join(parts),
+            "characters": sum(len(part) for part in parts),
+            "reactivated": True,
+        }
 
 
 # v8 记忆种类优先级: 亲历的流程/情景决策 > 书本理论.
@@ -173,6 +404,34 @@ def _activation_score(row: dict, now: int) -> float:
     return (1.0 * recency + 0.6 * frequency + 0.8 * emotional + 0.5 * novelty
             + 0.7 * connection + 0.6 * predictive - 0.3 * age_penalty
             + 0.5 * importance_boost + 1.0 * kind_priority)
+
+
+def _memory_state(row: dict, now: int) -> dict:
+    """把连续遗忘曲线映射为可解释的四层工作状态。
+
+    物理数据仍保留；“遗忘”首先表示退出普通召回。精确字面或高相似语义命中
+    仍可从深层恢复，随后 touch-on-recall 会把它重新拉回前景。
+    """
+    last = int(row.get("last_recall_ts") or row.get("created_ts") or now)
+    recency_days = max(0.0, (now - last) / 86400.0)
+    stability = max(1.0, float(row.get("stability") or 14.0))
+    retrievability = math.exp(-recency_days / stability)
+    if retrievability >= 0.85:
+        tier = "foreground"
+    elif retrievability >= 0.55:
+        tier = "active"
+    elif retrievability >= 0.20:
+        tier = "latent"
+    else:
+        tier = "deep"
+    return {
+        "tier": tier,
+        "retrievability": round(retrievability, 4),
+        "activation": round(_activation_score(row, now), 4),
+        "days_since_recall": round(recency_days, 2),
+        "recall_count": int(row.get("recall_count") or 0),
+        "stability_days": round(stability, 2),
+    }
 
 
 def _spread_activation(seed_ids: list[str], hops: int = 2, decay: float = 0.7) -> dict[str, float]:
@@ -353,10 +612,29 @@ def _hard_delete(c: sqlite3.Connection, mid: str) -> None:
     c.execute("DELETE FROM memories WHERE id=?", (mid,))
     c.execute("DELETE FROM mem_concepts WHERE memory_id=?", (mid,))
     c.execute("DELETE FROM memories_fts WHERE memory_id=?", (mid,))
+    c.execute("DELETE FROM memories_hot_fts WHERE memory_id=?", (mid,))
     c.execute("DELETE FROM memories_vec WHERE memory_id=?", (mid,))  # v4: 别留孤儿向量
     c.execute("DELETE FROM edges WHERE src=? OR dst=?", (mid, mid))
-    c.execute("DELETE FROM typed_edges WHERE src=? OR dst=?", (mid, mid))  # v5: 清类型化边
     c.execute("DELETE FROM review_state WHERE memory_id=?", (mid,))
+    # Cognitive tables deliberately have no FK cascades, because the legacy
+    # database is upgraded online. Keep all additive metadata consistent here.
+    c.execute("DELETE FROM memory_cognitive WHERE memory_id=?", (mid,))
+    c.execute("DELETE FROM memory_facets WHERE memory_id=?", (mid,))
+    c.execute("DELETE FROM memory_evidence WHERE memory_id=?", (mid,))
+    c.execute(
+        "DELETE FROM memory_conflicts WHERE left_memory_id=? OR right_memory_id=?",
+        (mid, mid),
+    )
+    c.execute("UPDATE hippocampal_inbox SET memory_id='' WHERE memory_id=?", (mid,))
+    c.execute("DELETE FROM memory_acl WHERE memory_id=?", (mid,))
+    c.execute(
+        "DELETE FROM memory_lineage WHERE child_memory_id=? OR parent_memory_id=?",
+        (mid, mid),
+    )
+    c.execute("DELETE FROM memory_promotion_log WHERE memory_id=?", (mid,))
+    c.execute("DELETE FROM memory_activations WHERE memory_id=?", (mid,))
+    c.execute("DELETE FROM retrieval_run_items WHERE memory_id=?", (mid,))
+    c.execute("DELETE FROM typed_edges WHERE src=? OR dst=?", (mid, mid))  # v5: 清类型化边
 
 
 @router.post("/forget")

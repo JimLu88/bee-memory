@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -72,6 +73,23 @@ def test_vector_search_ranks_semantically(db):
     assert set(ids[:2]) == {a, b}
 
 
+def test_fixed_budget_vector_search_never_loads_cold_matrix(db, monkeypatch):
+    _store("episodic", "cold vector should warm outside the request")
+    semantic.invalidate_cache()
+    scheduled: list[float] = []
+    monkeypatch.setattr(
+        semantic, "warm_cache_async",
+        lambda delay_seconds=1.0: scheduled.append(delay_seconds) or True,
+    )
+    monkeypatch.setattr(
+        semantic, "embed_query",
+        lambda *args, **kwargs: pytest.fail("cold fixed-budget recall embedded before warm cache"),
+    )
+    with memory._conn() as conn:
+        assert semantic.vector_search(conn, "query", k=4, warm_only=True) == []
+    assert scheduled == [0.0]
+
+
 def test_ppr_spreads_over_edges(db):
     a = _store("episodic", "海马体索引 与 扩散激活 记忆核心")
     b = _store("episodic", "再谈 海马体索引 和 扩散激活 实现")
@@ -91,6 +109,44 @@ def test_connect_ppr_finds_bridge(db):
         b_ids = associative.entry_search(conn, "备货策略独有乙", k=5)
         res = ppr.connect_ppr(conn, a_ids, b_ids)
     assert res["connected"] is True and res["connectors"]
+
+
+def test_ppr_serves_stable_snapshot_while_edges_are_changing(db, monkeypatch):
+    """An active book import must not rebuild the full graph on a user request."""
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("INSERT INTO edges(src, dst, weight) VALUES ('old-a', 'old-b', 1.0)")
+        conn.commit()
+        ids_before, _, matrix_before = ppr._load_graph(conn, force_refresh=True)
+        conn.execute("INSERT INTO edges(src, dst, weight) VALUES ('new-a', 'new-b', 1.0)")
+        conn.commit()
+
+        scheduled = []
+        monkeypatch.setattr(ppr, "STALE_REFRESH_SECONDS", 0.0)
+        monkeypatch.setattr(
+            ppr,
+            "warm_cache_async",
+            lambda delay_seconds=0.0: scheduled.append(delay_seconds) or True,
+        )
+        ppr.invalidate_cache()
+        ids_after, _, matrix_after = ppr._load_graph(conn)
+
+    assert ids_after == ids_before
+    assert matrix_after is matrix_before
+    assert "new-a" not in ids_after
+    assert scheduled
+
+
+def test_ppr_accepts_a_fresh_database_before_schema_creation(tmp_path, monkeypatch):
+    fresh = tmp_path / "fresh.sqlite"
+    monkeypatch.setattr(ppr, "DB_PATH", fresh)
+    ppr.invalidate_cache()
+
+    with sqlite3.connect(str(fresh)) as conn:
+        ids, index, matrix = ppr._load_graph(conn, force_refresh=True)
+
+    assert ids == []
+    assert index == {}
+    assert matrix.shape == (0, 0)
 
 
 def test_hybrid_recall_compact(db):

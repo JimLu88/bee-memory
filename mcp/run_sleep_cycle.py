@@ -13,8 +13,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-BASE = os.environ.get("BEE_MEMORY_URL", "http://127.0.0.1:8004")
-TOKEN = os.environ.get("BEE_BEARER_TOKEN", "dev-token-change-me")
+from memory_client_config import BASE, TOKEN
+
 BACKEND_DIR = Path(os.environ.get("BEE_BACKEND_DIR", r"D:/AI/AI 记忆中心/backend"))
 DO_FORGET = os.environ.get("BEE_SLEEP_FORGET", "0")  # 1=真删低激活记忆; 默认只报告
 

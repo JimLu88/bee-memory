@@ -3,7 +3,9 @@ LLM 与嵌入全 mock, 不依赖 Ollama."""
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -60,16 +62,88 @@ def test_invalidate_hides_from_recall(db):
         assert c.execute("SELECT invalid_at FROM memories WHERE id=?", (a,)).fetchone()[0] is not None
 
 
-def test_supersede_sets_flags_and_edge(db):
+def test_direct_supersede_is_disabled_by_governance(db):
     old = _store("semantic", "定价旧结论")
     new = _store("semantic", "定价新结论")
     from app.associative import SupersedeIn, supersede_endpoint
-    r = supersede_endpoint(SupersedeIn(old_id=old, new_id=new))
-    assert r["status"] == "ok"
+    with pytest.raises(Exception, match="governance/supersede"):
+        supersede_endpoint(SupersedeIn(old_id=old, new_id=new))
     with memory._conn() as c:
         row = c.execute("SELECT invalid_at, superseded_by FROM memories WHERE id=?", (old,)).fetchone()
-        assert row[0] is not None and row[1] == new
-        assert c.execute("SELECT 1 FROM edges WHERE src=? AND dst=?", (new, old)).fetchone()
+        assert row[0] is None and not row[1]
+
+
+def test_exact_get_reactivates_deep_memory(db):
+    mid = _store("semantic", "一个很久没有调用、但可被精确找回的决定", importance=5)
+    old_ts = int(time.time()) - 365 * 86400
+    with memory._conn() as c:
+        c.execute(
+            "UPDATE memories SET created_ts=?, last_recall_ts=?, recall_count=0, stability=14 WHERE id=?",
+            (old_ts, old_ts, mid),
+        )
+
+    result = memory.get_by_id(mid)
+    assert result["memory_state_before"]["tier"] == "deep"
+    assert result["memory_state_after"]["tier"] == "foreground"
+    assert result["memory_state_after"]["recall_count"] == 1
+
+
+def test_bundle_reconstructs_long_memory_and_reactivates_all_chunks(db):
+    bundle_id = "mb-1234567890abcdef"
+    parts = ["第一段长期记忆。", "第二段长期记忆。", "第三段长期记忆。"]
+    ids = []
+    for index, part in enumerate(parts):
+        stored = memory.store(memory.StoreRequest(
+            kind="semantic",
+            content=json.dumps({"content": part}, ensure_ascii=False),
+            importance=5,
+            mode_id="tachikoma:test",
+            meta={
+                "bundle_id": bundle_id,
+                "chunk_index": index,
+                "chunk_count": len(parts),
+            },
+        ))
+        ids.append(stored["memory_id"])
+    old_ts = int(time.time()) - 365 * 86400
+    with memory._conn() as c:
+        c.execute(
+            f"UPDATE memories SET created_ts=?, last_recall_ts=?, recall_count=0, stability=14 "
+            f"WHERE id IN ({','.join('?' * len(ids))})",
+            [old_ts, old_ts, *ids],
+        )
+
+    result = memory.get_bundle(bundle_id)
+    assert result["found"] is True
+    assert result["content"] == "".join(parts)
+    assert [item["id"] for item in result["items"]] == ids
+    assert all(item["memory_state_before"]["tier"] == "deep" for item in result["items"])
+    with memory._conn() as c:
+        counts = [
+            c.execute("SELECT recall_count FROM memories WHERE id=?", (mid,)).fetchone()[0]
+            for mid in ids
+        ]
+    assert counts == [1, 1, 1]
+
+
+def test_four_memory_tiers_follow_retrievability():
+    now = 2_000_000_000
+    row = {
+        "kind": "semantic",
+        "importance": 3,
+        "created_ts": now - 100 * 86400,
+        "recall_count": 0,
+        "stability": 14.0,
+    }
+    expected = {
+        1: "foreground",
+        5: "active",
+        20: "latent",
+        60: "deep",
+    }
+    for days, tier in expected.items():
+        state = memory._memory_state({**row, "last_recall_ts": now - days * 86400}, now)
+        assert state["tier"] == tier
 
 
 def test_distill_creates_semantic_with_provenance(db, monkeypatch):

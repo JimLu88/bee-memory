@@ -4,13 +4,13 @@
 feedback→procedural, project→episodic, user/reference→semantic. 首次导入, 别重复跑.
 """
 from __future__ import annotations
-import json, os, re, urllib.request
+import json, os, re, sys, urllib.request
 from pathlib import Path
 
 MEM_DIR = Path(os.environ.get("BEE_FILEMEM_DIR",
               r"C:\Users\lzdwy\.claude\projects\C--Users-lzdwy\memory"))
-BASE = "http://127.0.0.1:8004"
-TOK = os.environ.get("BEE_BEARER_TOKEN", "dev-token-change-me")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mcp"))
+from memory_client_config import BASE, TOKEN as TOK
 H = {"Authorization": f"Bearer {TOK}", "Content-Type": "application/json"}
 
 KIND_MAP = {"feedback": "procedural", "project": "episodic",

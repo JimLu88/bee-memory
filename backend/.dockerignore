@@ -1,0 +1,10 @@
+data
+backups
+.git
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

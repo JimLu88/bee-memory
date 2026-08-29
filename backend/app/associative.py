@@ -27,7 +27,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from . import ppr, semantic  # v4 P1: 语义向量 + 个性化 PageRank
@@ -35,6 +35,8 @@ from . import ppr, semantic  # v4 P1: 语义向量 + 个性化 PageRank
 router = APIRouter()
 
 DB_PATH = Path(__file__).parent.parent / "data" / "memories.sqlite"
+_HOT_FTS_READY = False
+_HOT_FTS_WARMING = False
 
 # ---- 护栏参数 (env 可调) ----
 HUB_DF_RATIO = float(os.environ.get("BEE_HUB_DF_RATIO", "0.05"))   # 概念出现在 >5% 记忆里 = hub, 不建边
@@ -164,6 +166,13 @@ def ensure_associative_schema(c: sqlite3.Connection) -> None:
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             memory_id UNINDEXED, content, tokenize='trigram'
         )""")
+    # Fast conversational recall excludes raw/deep book chunks.  The table is
+    # populated from cognitive lifecycle metadata and remains additive; Q3
+    # research still uses the complete memories_fts index.
+    c.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_hot_fts USING fts5(
+            memory_id UNINDEXED, content, tokenize='trigram'
+        )""")
     # v4 P1: 给 memories 补可空列 (token_count/stability/difficulty). 幂等, 不动旧列.
     # 放这里保证任何连接 (associative._conn / memory._conn) 都先迁移, 避免 SELECT * 缺列.
     if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'").fetchone():
@@ -195,12 +204,22 @@ def _conn() -> sqlite3.Connection:
 
 
 # ---- 增量: 单条记忆写入时索引 (供 memory.store 调用) ----
-def index_one_memory(c: sqlite3.Connection, memory_id: str, content: str) -> int:
-    """把一条记忆的概念/FTS/dangling 落库. 返回抽到的概念数. 幂等 (可重复调)."""
+def index_one_memory(
+    c: sqlite3.Connection,
+    memory_id: str,
+    content: str,
+    *,
+    index_concepts: bool = True,
+    replace_existing: bool = True,
+) -> int:
+    """Index one memory; raw book chunks may defer the concept graph."""
     now = int(time.time())
     # FTS
-    c.execute("DELETE FROM memories_fts WHERE memory_id=?", (memory_id,))
+    if replace_existing:
+        c.execute("DELETE FROM memories_fts WHERE memory_id=?", (memory_id,))
     c.execute("INSERT INTO memories_fts(memory_id, content) VALUES (?,?)", (memory_id, content or ""))
+    if not index_concepts:
+        return 0
     # dangling: 显式 [[link]] 单独记 (可能还没有对应概念节点)
     wikilinks = set(extract_wikilinks(content))
     for name in wikilinks:
@@ -385,25 +404,113 @@ def _fts_query(query: str) -> str:
     q = (query or "").strip()
     if not q:
         return ""
-    frags = re.findall(r"[一-龥]{3,}|[A-Za-z0-9]{3,}", q)
+    english = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", q)
+    chinese: list[str] = []
+    # A natural-language Chinese question is usually one uninterrupted Han
+    # run.  Quoting that whole run turns FTS into an accidental exact-sentence
+    # search.  Build a compact OR query from meaningful words and adjacent
+    # word pairs instead.  The pairs also make two-character concepts such as
+    # “样品/发货” usable with the trigram tokenizer.
+    if _HAS_JIEBA:
+        words = [
+            token.strip() for token in jieba.cut(q)
+            if re.fullmatch(r"[一-龥]{2,8}", token.strip()) and token.strip() not in _STOP
+        ]
+        chinese.extend(token for token in words if len(token) >= 3)
+        chinese.extend((left + right)[:12] for left, right in zip(words, words[1:]))
+    else:
+        for run in re.findall(r"[一-龥]{3,}", q):
+            chinese.extend(run[i:i + 3] for i in range(min(len(run) - 2, 18)))
+    frags = list(dict.fromkeys([*chinese, *english]))[:24]
     if not frags:
         return '"' + q.replace('"', '') + '"'
     return " OR ".join('"' + f.replace('"', '') + '"' for f in frags)
 
 
-def fts_search(c: sqlite3.Connection, query: str, k: int = 20) -> list[str]:
+def fts_search(c: sqlite3.Connection, query: str, k: int = 20,
+               candidate_pool: int = 0, scope: str = "all") -> list[str]:
     """返回 FTS5 命中的 memory_id, 按 bm25 排序. query 空则返回 []."""
     expr = _fts_query(query)
     if not expr:
         return []
+    table = "memories_hot_fts" if scope == "hot" else "memories_fts"
     try:
+        if candidate_pool > 0:
+            # Full BM25 over a broad trigram OR may rank tens of thousands of
+            # rows before LIMIT is applied.  SQLite's FTS5 planner can also
+            # ignore a rowid IN (...) bound until after MATCH has produced and
+            # ranked the broad OR set, so a second "bounded" MATCH is not a
+            # dependable latency bound.  Rank each small fragment independently
+            # and fuse those ranks in Python instead.  This keeps the database
+            # work bounded by fragments * per_fragment and avoids a second
+            # broad virtual-table scan.
+            fragments = [part.strip() for part in expr.split(" OR ") if part.strip()]
+            pool_cap = max(k, min(900, int(candidate_pool)))
+            per_fragment = max(
+                8,
+                (pool_cap + max(1, len(fragments)) - 1) // max(1, len(fragments)),
+            )
+            fused: dict[str, float] = {}
+            bm25_strength: dict[str, float] = {}
+            best_rank: dict[str, int] = {}
+            for fragment in fragments or [expr]:
+                fragment_rows = c.execute(
+                    f"SELECT memory_id,bm25({table}) FROM {table} WHERE {table} MATCH ? "
+                    f"ORDER BY bm25({table}) LIMIT ?",
+                    (fragment, per_fragment),
+                ).fetchall()
+                for rank, row in enumerate(fragment_rows, 1):
+                    memory_id = str(row[0])
+                    fused[memory_id] = fused.get(memory_id, 0.0) + 1.0 / (60 + rank)
+                    bm25_strength[memory_id] = (
+                        bm25_strength.get(memory_id, 0.0) + max(0.0, -float(row[1] or 0.0))
+                    )
+                    best_rank[memory_id] = min(best_rank.get(memory_id, rank), rank)
+            if not fused:
+                return []
+            ordered = sorted(
+                fused,
+                key=lambda memory_id: (
+                    -fused[memory_id], -bm25_strength[memory_id],
+                    best_rank[memory_id], memory_id,
+                ),
+            )
+            return ordered[:min(k, pool_cap)]
         rows = c.execute(
-            "SELECT memory_id FROM memories_fts WHERE memories_fts MATCH ? ORDER BY bm25(memories_fts) LIMIT ?",
+            f"SELECT memory_id FROM {table} WHERE {table} MATCH ? ORDER BY bm25({table}) LIMIT ?",
             (expr, k),
         ).fetchall()
         return [r[0] for r in rows]  # 位置取值: 不依赖 row_factory (调用方连接可能是 tuple 工厂)
     except sqlite3.OperationalError:
         return []
+
+
+def warm_hot_fts() -> bool:
+    """Warm conversational FTS pages before readiness is advertised.
+
+    Loading the tokenizer alone does not touch SQLite's FTS pages.  On the NAS
+    that made the first real recall several seconds slower than later calls.
+    These bounded searches warm Chinese and Latin trigram paths without
+    rebuilding the index or retaining memory contents in application state.
+    """
+    global _HOT_FTS_READY, _HOT_FTS_WARMING
+    _HOT_FTS_WARMING = True
+    try:
+        with _conn() as conn:
+            fts_search(
+                conn, "塔奇克马 记忆 项目 任务", k=8,
+                candidate_pool=32, scope="hot",
+            )
+            fts_search(
+                conn, "Tachikoma memory project task", k=8,
+                candidate_pool=32, scope="hot",
+            )
+        _HOT_FTS_READY = True
+    except Exception:
+        _HOT_FTS_READY = False
+    finally:
+        _HOT_FTS_WARMING = False
+    return _HOT_FTS_READY
 
 
 def entry_search(c: sqlite3.Connection, query: str, k: int = 20) -> list[str]:
@@ -539,13 +646,14 @@ def _title_snippet(content: str) -> tuple[str, str]:
 
 
 def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
-                  compact: bool = True, boost_mode: str = "", personal: bool = False) -> dict[str, Any]:
+                  compact: bool = True, boost_mode: str = "", personal: bool = False,
+                  touch: bool = True) -> dict[str, Any]:
     """向量(语义)+FTS(字面) 找入口 → 个性化 PageRank 沿共现边扩散 → 综合排序.
 
     综合分 = 0.5*语义相似 + 0.3*PPR扩散(归一) + 0.2*激活分(归一). 这一步负责"问A召回B".
     compact=True: 只回 {id,title,snippet,score,token_count,via}; False: 回完整行.
     """
-    from .memory import _activation_score  # 延迟导入避免循环
+    from .memory import _activation_score, _memory_state  # 延迟导入避免循环
     now = int(time.time())
     with _conn() as c:
         c.row_factory = sqlite3.Row
@@ -603,6 +711,13 @@ def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
             vs = vec_map.get(mid, 0.0)
             ps = (ppr_scores.get(mid, 0.0) / max_ppr) if max_ppr else 0.0
             ac = (acts[mid] / max_act) if max_act else 0.0
+            state = _memory_state(dict(r), now)
+            # 功能性遗忘：深层记忆不能只靠宽泛的关系扩散冒出来。只有字面命中
+            # 或足够接近的语义查询才能把它找回；找回后下面的 touch 会重新激活。
+            if state["tier"] == "deep" and mid not in fts_ids and vs < 0.55:
+                continue
+            if state["tier"] == "latent" and mid not in fts_ids and vs < 0.30 and mid not in entry:
+                continue
             final = 0.5 * vs + 0.3 * ps + 0.2 * ac
             if boost_mode and r["mode_id"] == boost_mode:  # 编码特异性: 同项目/同语境的记忆提分
                 final += 0.08
@@ -628,9 +743,12 @@ def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
             deduped.append(tup)
             if len(deduped) >= k:
                 break
-        # touch-on-recall
-        for _, r, _, _, _ in deduped:
-            c.execute("UPDATE memories SET recall_count=recall_count+1, last_recall_ts=? WHERE id=?", (now, r["id"]))
+        # Planned recall generates a wider candidate pool.  Do not strengthen
+        # candidates that its later filters reject.  Legacy callers keep the
+        # original touch-on-recall behaviour by default.
+        if touch:
+            for _, r, _, _, _ in deduped:
+                c.execute("UPDATE memories SET recall_count=recall_count+1, last_recall_ts=? WHERE id=?", (now, r["id"]))
 
         items = []
         for final, r, vs, ps, via in deduped:
@@ -643,12 +761,20 @@ def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
             except Exception:
                 pass
             if compact:
+                memory_state = _memory_state(rd, now)
                 items.append({"id": rd["id"], "title": title, "snippet": snip,
                               "score": round(final, 4), "token_count": rd.get("token_count"),
                               "kind": rd.get("kind"), "importance": rd.get("importance"),
-                              "source": src, "via": via})
+                              "source": src, "via": via,
+                              "memory_state": memory_state["tier"],
+                              "retrievability": memory_state["retrievability"],
+                              "recall_count": memory_state["recall_count"],
+                              "stability": memory_state["stability_days"],
+                              "reactivated": memory_state["tier"] in ("latent", "deep")})
             else:
-                rd.update({"score": round(final, 4), "via": via, "title": title, "source": src})
+                memory_state = _memory_state(rd, now)
+                rd.update({"score": round(final, 4), "via": via, "title": title, "source": src,
+                           "memory_state": memory_state})
                 items.append(rd)
     return {"items": items, "entry_count": len(entry), "ppr_reached": len(ppr_scores),
             "semantic": bool(vec_map)}
@@ -656,11 +782,13 @@ def hybrid_recall(query: str, k: int = 8, persona_id: str = "", kind: str = "",
 
 @router.get("/recall-hybrid")
 def recall_hybrid_endpoint(query: str, k: int = 8, persona_id: str = "", kind: str = "",
-                           compact: int = 1, boost_mode: str = "", personal: int = 0) -> dict:
+                           compact: int = 1, boost_mode: str = "", personal: int = 0,
+                           touch: int = 1) -> dict:
     """P1 混合检索端点 (语义+字面+关联扩散). 默认紧凑返回 (省 token). boost_mode=同项目提分.
     personal=1: 只在用户自己的记忆里找 (排除蜂群 persona 书本知识)."""
     return hybrid_recall(query, k=k, persona_id=persona_id, kind=kind,
-                         compact=bool(compact), boost_mode=boost_mode, personal=bool(personal))
+                         compact=bool(compact), boost_mode=boost_mode, personal=bool(personal),
+                         touch=bool(touch))
 
 
 def relation_search(c, query: str, k: int = 5, min_sim: float = 0.4) -> list[dict]:
@@ -816,23 +944,11 @@ class SupersedeIn(BaseModel):
 
 @router.post("/supersede")
 def supersede_endpoint(req: SupersedeIn) -> dict:
-    """双时序: 新事实取代旧事实. 旧的打 invalid_at + superseded_by=新id, 并建一条取代边."""
-    now = int(time.time())
-    with _conn() as c:
-        exists = c.execute("SELECT 1 FROM memories WHERE id=?", (req.new_id,)).fetchone()
-        if not exists:
-            return {"status": "error", "detail": "new_id 不存在"}
-        c.execute("UPDATE memories SET invalid_at=?, superseded_by=? WHERE id=?",
-                  (now, req.new_id, req.old_id))
-        # 旧的立即退出复习闸 + 摘除共现边 (取代边保留)
-        c.execute("DELETE FROM review_state WHERE memory_id=?", (req.old_id,))
-        c.execute("DELETE FROM edges WHERE (src=? OR dst=?) AND (kind='cooccur' OR kind IS NULL)",
-                  (req.old_id, req.old_id))
-        # 取代边 (新 -> 旧, kind=supersede 不被 reindex 清), 便于回溯"我当时以为什么"
-        c.execute("INSERT OR REPLACE INTO edges(src,dst,weight,kind) VALUES (?,?,?,'supersede')",
-                  (req.new_id, req.old_id, 3.0))
-    ppr.invalidate_cache()
-    return {"status": "ok", "old_id": req.old_id, "new_id": req.new_id, "invalid_at": now}
+    """Deprecated unsafe path: replacement now requires governance evidence."""
+    raise HTTPException(
+        409,
+        "direct supersede is disabled; use /memory/governance/supersede with evidence_locator",
+    )
 
 
 @router.get("/digest")

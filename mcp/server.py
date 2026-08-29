@@ -25,8 +25,8 @@ except Exception as e:  # pragma: no cover
     sys.stderr.write(f"[claude-brain] mcp SDK 缺失: {e}\n请 py -3.11 -m pip install mcp\n")
     raise
 
-BASE = os.environ.get("BEE_MEMORY_URL", "http://127.0.0.1:8004")
-TOKEN = os.environ.get("BEE_BEARER_TOKEN", "dev-token-change-me")
+from memory_client_config import BASE, TOKEN, is_loopback
+
 BACKEND_DIR = Path(os.environ.get("BEE_BACKEND_DIR", r"D:/AI/AI 记忆中心/backend"))
 
 mcp = FastMCP("claude-brain")
@@ -48,7 +48,8 @@ def _req(method: str, path: str, params: dict | None = None,
 
 def _health(timeout: float = 1.5) -> bool:
     try:
-        _req("GET", "/healthz", timeout=timeout)
+        # Authenticated and cheap: verifies both the service and our credential.
+        _req("GET", "/memory/review/stats", timeout=timeout)
         return True
     except Exception:
         return False
@@ -58,6 +59,9 @@ def _ensure_service() -> bool:
     """确保 bee-memory 在跑. 没起就 detached 拉起 uvicorn, 等就绪. 拉不起返回 False."""
     if _health():
         return True
+    if not is_loopback():
+        # 群晖主库由 Docker unless-stopped 管理。绝不在 PC 偷起另一套分叉库。
+        return False
     try:
         creation = 0x00000008 | 0x08000000 if os.name == "nt" else 0  # DETACHED|NO_WINDOW
         subprocess.Popen(

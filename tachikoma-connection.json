@@ -1,0 +1,17 @@
+{
+  "schema_version": "tachikoma-connection/v1",
+  "software_id": "ai-memory",
+  "service": "bee-memory",
+  "version": "0.2.0",
+  "contract_version": "v1",
+  "interface": "http",
+  "bind_host": "127.0.0.1",
+  "default_port": 8004,
+  "health_path": "/healthz",
+  "production_execution_enabled": false,
+  "upgrade_execution_enabled": false,
+  "business_actions": [],
+  "test_evidence": {"passed": true, "command": "python -m pytest -q tests/test_tachikoma_connection.py", "summary": "3 identity-only tests passed; memory database and MCP remained unopened."},
+  "acceptance_evidence": {"sandbox_business_flow_verified": false, "live_business_result_verified": false, "rollback_drill_verified": false, "evidence_refs": []},
+  "rollback": {"method": "Unregister the identity task and remove only connection-layer files.", "data_migration_required": false}
+}

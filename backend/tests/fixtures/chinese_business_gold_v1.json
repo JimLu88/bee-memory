@@ -1,0 +1,32 @@
+{
+  "version": "chinese-business-gold-v1",
+  "description": "人工整理的中文业务召回集；包含近义表达、相邻业务、权限隔离和冲突样本。",
+  "records": [
+    {"id":"erp-price-approval","kind":"procedural","content":"ERP 改价必须先核对真实 SKU、当前售价和活动价，再由财务复核毛利，不能直接覆盖当天订单价格。","domains":["erp","财务"],"entities":["sku","改价"]},
+    {"id":"erp-stock-reserve","kind":"semantic","content":"库存中的活动预留量不能当作可售库存；补货判断要扣除未发货订单和活动锁定数量。","domains":["erp","库存"],"entities":["可售库存","补货"]},
+    {"id":"sample-quality-gate","kind":"procedural","content":"样品验收先列全产品名称、SKU、数量，再逐件检查外观、结构、尺寸、功能和颜色；不合格项拍照并关闭后才能发货。","domains":["样品","质量"],"entities":["验收","不合格"]},
+    {"id":"sample-color-control","kind":"semantic","content":"同款样板备货要使用确认过的合格色板；面料和板材颜色不一致时必须重新备货，不能混装。","domains":["样品","供应链"],"entities":["色板","备货"]},
+    {"id":"logistics-loading-close","kind":"procedural","content":"样品装车不是任务结束；要确认物流单号、装车照片、承运方、预计到达时间，并在签收后关闭任务。","domains":["物流","闭环"],"entities":["装车","签收"]},
+    {"id":"customer-service-proof","kind":"procedural","content":"客服问题不能只标记已回复；要保存客户原话、处理口径和结果证据，确认客户收到并且问题解决后才算完成。","domains":["客服","闭环"],"entities":["客户","证据"]},
+    {"id":"xiaohongshu-content-plan","kind":"semantic","content":"小红书内容先确定用户真实问题和搜索词，再安排选题、素材和发布时间；纯品牌口号不作为首要内容。","domains":["小红书","内容"],"entities":["选题","搜索词"]},
+    {"id":"product-photo-shotlist","kind":"procedural","content":"新品拍照前要列产品清单、SKU、数量、必拍角度和用途；缺少归档原图会阻塞后续评价图与详情页合成。","domains":["摄影","图片"],"entities":["新品拍照","归档"]},
+    {"id":"aeo-evidence-boundary","kind":"semantic","content":"AEO 对外表述只能使用可复核证据；来源不足时必须降低措辞，不能把推测写成已经验证的事实。","domains":["aeo","内容"],"entities":["证据","对外表述"]},
+    {"id":"tax-quarterly-review","kind":"procedural","content":"季度报税前要核对销售收入、平台账单、退款和进项票；申报完成后保存回执并登记下一季度复查日期。","domains":["财务","税务"],"entities":["季度报税","回执"]},
+    {"id":"deadline-correction","kind":"semantic","content":"截止日期发生变化时不能静默覆盖旧日期；要记录谁确认、为什么延期、影响哪些后续任务，并通知负责人。","domains":["任务","治理"],"entities":["截止日期","延期"]},
+    {"id":"private-payroll","kind":"semantic","content":"个人工资与银行卡流水只允许 Jim 本人读取，团队成员和普通 Agent 不得召回。","domains":["财务","隐私"],"entities":["工资","银行卡"],"owner_id":"private-owner"},
+    {"id":"color-conflict-old","kind":"semantic","content":"旧记录称样板统一使用暖白色，来源是早期口头讨论，尚未获得最终色板确认。","domains":["样品","供应链"],"entities":["色板"],"conflicted":true},
+    {"id":"color-conflict-new","kind":"semantic","content":"最新确认记录要求样板统一使用浅灰色，证据是已签字的色板确认单。","domains":["样品","供应链"],"entities":["色板"]}
+  ],
+  "queries": [
+    {"query":"活动库存到底能不能直接拿来卖","relevant":{"erp-stock-reserve":3,"erp-price-approval":1}},
+    {"query":"样品发货前具体要检查哪些东西","relevant":{"sample-quality-gate":3,"sample-color-control":2,"logistics-loading-close":1}},
+    {"query":"货已经装车了是不是可以把待办勾掉","relevant":{"logistics-loading-close":3,"customer-service-proof":1}},
+    {"query":"客服回复完客户就算处理完成了吗","relevant":{"customer-service-proof":3,"logistics-loading-close":1}},
+    {"query":"新品图片为什么一直没法做评价图","relevant":{"product-photo-shotlist":3,"xiaohongshu-content-plan":1}},
+    {"query":"AEO 里来源不够的判断应该怎么写","relevant":{"aeo-evidence-boundary":3}},
+    {"query":"季度报税做完还需要留下什么","relevant":{"tax-quarterly-review":3}},
+    {"query":"任务延期以后为什么不能直接改日期","relevant":{"deadline-correction":3}},
+    {"query":"同款样板颜色不一致该怎么办","relevant":{"sample-color-control":3,"sample-quality-gate":2,"color-conflict-new":1}},
+    {"query":"Jim 的工资银行卡记录","relevant":{},"forbidden":["private-payroll"]}
+  ]
+}

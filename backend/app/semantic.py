@@ -14,6 +14,7 @@ import json
 import os
 import sqlite3
 import struct
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -122,14 +123,14 @@ def embed_and_store(c: sqlite3.Connection, memory_id: str, content: str) -> bool
     return True
 
 
-def embed_query(text: str) -> list[float] | None:
+def embed_query(text: str, timeout: float | None = None) -> list[float] | None:
     """带小缓存的查询嵌入 (同一查询在检索/连接/桥接里会被多次嵌)."""
     key = (text or "").strip()
     if not key:
         return None
     if key in _QCACHE:
         return _QCACHE[key]
-    v = embed_text(key)
+    v = embed_text(key, timeout=timeout)
     if v is not None:
         if len(_QCACHE) > 256:
             _QCACHE.clear()
@@ -139,31 +140,64 @@ def embed_query(text: str) -> list[float] | None:
 
 # ---- 检索 (numpy 暴力余弦 + 进程内缓存) ----
 _CACHE: dict[str, Any] = {"n": -1, "ids": None, "mat": None, "ts": 0.0}
+_CACHE_LOCK = threading.RLock()
+_WARM_LOCK = threading.Lock()
+_WARMING = False
 
 
 def _load_matrix(c: sqlite3.Connection) -> tuple[list[str], np.ndarray]:
     """载入全部向量为矩阵. 按行数缓存, 变了才重载 (避免每次查询读 50MB)."""
-    n = c.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0]
-    if _CACHE["n"] == n and _CACHE["mat"] is not None and (time.time() - _CACHE["ts"] < 300):
-        return _CACHE["ids"], _CACHE["mat"]
-    ids: list[str] = []
-    vecs: list[np.ndarray] = []
-    for mid, dim, blob in c.execute("SELECT memory_id, dim, vec FROM memories_vec"):
-        try:
-            v = _unpack(blob, dim)
-        except Exception:
-            continue  # 截断/损坏的 blob 单行跳过, 别让 frombuffer 崩溃拖垮全检索
-        if v.shape[0] != EMBED_DIM:   # 维度守卫: 混维(换模型/残留)不进矩阵, 否则 vstack 崩溃
-            continue
-        ids.append(mid)
-        vecs.append(v)
-    mat = np.vstack(vecs) if vecs else np.zeros((0, EMBED_DIM), dtype=np.float32)
-    _CACHE.update({"n": n, "ids": ids, "mat": mat, "ts": time.time()})
-    return ids, mat
+    with _CACHE_LOCK:
+        n = c.execute(
+            "SELECT COUNT(memory_id) FROM memories_vec INDEXED BY sqlite_autoindex_memories_vec_1"
+        ).fetchone()[0]
+        # Row-count validation plus explicit invalidation makes a time-based
+        # expiry unnecessary.  Reloading 17k vectors every five minutes made
+        # the first user after each expiry pay the full NAS I/O cost.
+        if _CACHE["n"] == n and _CACHE["mat"] is not None:
+            return _CACHE["ids"], _CACHE["mat"]
+        ids: list[str] = []
+        vecs: list[np.ndarray] = []
+        for mid, dim, blob in c.execute("SELECT memory_id, dim, vec FROM memories_vec"):
+            try:
+                v = _unpack(blob, dim)
+            except Exception:
+                continue  # 截断/损坏的 blob 单行跳过, 别让 frombuffer 崩溃拖垮全检索
+            if v.shape[0] != EMBED_DIM:   # 维度守卫: 混维(换模型/残留)不进矩阵, 否则 vstack 崩溃
+                continue
+            ids.append(mid)
+            vecs.append(v)
+        mat = np.vstack(vecs) if vecs else np.zeros((0, EMBED_DIM), dtype=np.float32)
+        _CACHE.update({"n": n, "ids": ids, "mat": mat, "ts": time.time()})
+        return ids, mat
 
 
 def invalidate_cache() -> None:
-    _CACHE["n"] = -1
+    with _CACHE_LOCK:
+        _CACHE["n"] = -1
+
+
+def warm_cache_async(delay_seconds: float = 1.0) -> bool:
+    """Warm the vector matrix off the request path; coalesce duplicate warms."""
+    global _WARMING
+    with _WARM_LOCK:
+        if _WARMING:
+            return False
+        _WARMING = True
+
+    def run() -> None:
+        global _WARMING
+        try:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            with _conn() as conn:
+                _load_matrix(conn)
+        finally:
+            with _WARM_LOCK:
+                _WARMING = False
+
+    threading.Thread(target=run, name="bee-vector-warm", daemon=True).start()
+    return True
 
 
 def bridge(c: sqlite3.Connection, a: str, b: str, k: int = 5,
@@ -193,12 +227,27 @@ def bridge(c: sqlite3.Connection, a: str, b: str, k: int = 5,
 
 
 def vector_search(c: sqlite3.Connection, query: str, k: int = 20,
-                  candidate_ids: set[str] | None = None) -> list[tuple[str, float]]:
+                  candidate_ids: set[str] | None = None,
+                  timeout: float | None = None,
+                  warm_only: bool = False) -> list[tuple[str, float]]:
     """返回 [(memory_id, cosine)] 前 k. query 嵌不出或库空 → []. 向量已归一化, 点积=余弦.
 
     candidate_ids: 若给, 只在该集合内排 (persona/kind 预过滤后再语义排序).
     """
-    qv = embed_query(query)
+    # Fixed-budget recall must never pay the cold cost of reading every vector
+    # BLOB from NAS storage.  Startup already schedules an asynchronous warm;
+    # until it completes, return the lexical channel and mark vector recall as
+    # unavailable for this request.
+    if warm_only:
+        n = c.execute(
+            "SELECT COUNT(memory_id) FROM memories_vec INDEXED BY sqlite_autoindex_memories_vec_1"
+        ).fetchone()[0]
+        with _CACHE_LOCK:
+            ready = _CACHE["n"] == n and _CACHE["mat"] is not None
+        if not ready:
+            warm_cache_async(delay_seconds=0.0)
+            return []
+    qv = embed_query(query, timeout=timeout)
     if qv is None:
         return []
     ids, mat = _load_matrix(c)
@@ -248,6 +297,7 @@ def backfill(limit: int = 0, batch: int = 16) -> dict[str, Any]:
                 done += 1
             c.commit()
     invalidate_cache()
+    warm_cache_async(delay_seconds=0.2)
     return {"status": "ok", "embedded": done, "failed": failed,
             "remaining_before": total, "elapsed_s": round(time.time() - t0, 1)}
 
