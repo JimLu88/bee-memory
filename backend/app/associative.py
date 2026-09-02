@@ -195,9 +195,9 @@ def _cid(name: str) -> str:
 
 
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(str(DB_PATH), timeout=15)
+    c = sqlite3.connect(str(DB_PATH), timeout=60)
     c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA busy_timeout=8000")
+    c.execute("PRAGMA busy_timeout=60000")
     c.row_factory = sqlite3.Row
     ensure_associative_schema(c)
     return c
@@ -261,6 +261,13 @@ def reindex_concepts(rebuild_edges: bool = True, limit: int = 0) -> dict[str, An
                              "cooccur_edges": 0, "concept_edges": 0, "hub_concepts": 0,
                              "buckets_capped": 0, "fts_rows": 0}
     with _conn() as c:
+        # Full reindex replaces several derived tables. Reserve the single WAL
+        # writer before opening the read snapshot so a concurrent incremental
+        # store cannot make the later read->write upgrade fail with SQLITE_BUSY.
+        # Readers remain available in WAL mode; other writers wait for this
+        # already-atomic rebuild instead of corrupting or partially applying it.
+        c.commit()
+        c.execute("BEGIN IMMEDIATE")
         q = "SELECT id, content, kind FROM memories WHERE invalid_at IS NULL"  # 失效记忆不进概念图/FTS
         if limit > 0:
             q += f" ORDER BY last_recall_ts DESC LIMIT {int(limit)}"

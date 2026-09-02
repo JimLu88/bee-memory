@@ -16,6 +16,7 @@ from __future__ import annotations
 import json as _json
 import math
 import os
+import sqlite3
 import time
 import uuid as _uuid
 from pathlib import Path
@@ -386,6 +387,7 @@ def _backup() -> dict[str, Any]:
 
 
 STALE_LOCK_SEC = int(os.environ.get("BEE_SLEEP_STALE_SEC", "14400"))  # 4h, 高于最坏单次时长
+LOCK_RETRY_DELAYS = (5, 15, 30)
 
 
 def _acquire_lock() -> tuple[Path, str] | None:
@@ -421,6 +423,34 @@ def _release_lock(lock: Path, token: str) -> None:
         pass
 
 
+def _consolidate_with_lock_retry(consolidate_fn) -> dict[str, Any]:
+    """Retry only transient SQLite writer contention; never replay other failures."""
+    attempts = 0
+    for delay in (0, *LOCK_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        attempts += 1
+        try:
+            result = consolidate_fn()
+            if isinstance(result, dict):
+                result = dict(result)
+                result["lock_attempts"] = attempts
+            return result
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            transient = "database is locked" in message or "database is busy" in message
+            if not transient or attempts >= 1 + len(LOCK_RETRY_DELAYS):
+                raise
+
+
+def _run_step(out: dict[str, Any], name: str, operation) -> Any:
+    started = time.monotonic()
+    value = operation()
+    out[name] = value
+    out.setdefault("step_elapsed_s", {})[name] = round(time.monotonic() - started, 3)
+    return value
+
+
 def run_sleep_cycle(do_forget: bool = False, render_vault: bool = True) -> dict[str, Any]:
     """完整睡眠循环. do_forget=False 时只报告遗忘候选不删 (安全默认). 单实例串行."""
     acq = _acquire_lock()
@@ -430,22 +460,45 @@ def run_sleep_cycle(do_forget: bool = False, render_vault: bool = True) -> dict[
     from .memory import _conn, consolidate, forget, ForgetIn
     t0 = time.time()
     out: dict[str, Any] = {}
+    current_step = "startup"
     try:
-        out["file_sync"] = file_memory_sync.sync_file_memories()  # 0. 自动同步文件记忆进大脑 (用户无需手动)
-        out["distill"] = _distill_episodics()         # 0a 经验固化 episodic→semantic (LLM, 自管短事务)
-        out["consolidate"] = consolidate()            # 1+3 reindex + dangling promote
-        out["typed_edges"] = _typed_edges()           # 0b 类型化边 (LLM, 自管短事务)
-        out["backfill"] = semantic.backfill()         # 2 补嵌入
+        current_step = "file_sync"
+        _run_step(out, current_step, file_memory_sync.sync_file_memories)  # 0. 自动同步文件记忆进大脑
+        current_step = "distill"
+        _run_step(out, current_step, _distill_episodics)       # 0a episodic→semantic
+        current_step = "consolidate"
+        _run_step(out, current_step, lambda: _consolidate_with_lock_retry(consolidate))
+        current_step = "typed_edges"
+        _run_step(out, current_step, _typed_edges)             # 0b 类型化边
+        current_step = "backfill"
+        _run_step(out, current_step, semantic.backfill)        # 2 补嵌入
+        current_step = "stability_and_mocs"
+        step_started = time.monotonic()
         with _conn() as c:
             out["stability_updated"] = _update_stability(c)  # 4
             out["mocs"] = _generate_mocs(c)                  # 5
+        out.setdefault("step_elapsed_s", {})[current_step] = round(time.monotonic() - step_started, 3)
         if render_vault:
+            current_step = "vault"
+            step_started = time.monotonic()
             with _conn() as c:
                 out["vault"] = _render_vault(c)              # 6
-        out["forget"] = forget(ForgetIn(below_activation=0.05, dry_run=not do_forget, max_delete=100))  # 7
-        out["backup"] = _backup()                                                                       # 8 快照
+            out.setdefault("step_elapsed_s", {})[current_step] = round(time.monotonic() - step_started, 3)
+        current_step = "forget"
+        _run_step(out, current_step, lambda: forget(
+            ForgetIn(below_activation=0.05, dry_run=not do_forget, max_delete=100)))
+        current_step = "backup"
+        _run_step(out, current_step, _backup)
         out["status"] = "ok"
         out["elapsed_s"] = round(time.time() - t0, 1)
+    except Exception as exc:
+        message = str(exc).lower()
+        out.update(
+            status="failed",
+            failed_step=current_step,
+            error_type="database_locked" if "database is locked" in message else type(exc).__name__,
+            elapsed_s=round(time.time() - t0, 1),
+        )
     finally:
         _release_lock(lock, _token)
     return out

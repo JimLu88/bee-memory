@@ -10,6 +10,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import socket
 import sys
 import time
 import urllib.request
@@ -22,6 +23,7 @@ DO_FORGET = os.environ.get("BEE_SLEEP_FORGET", "0")  # 1=真删低激活记忆; 
 RECEIPT_DIR = Path(os.environ.get(
     "BEE_SLEEP_RECEIPT_DIR", r"D:/AI/AI 记忆中心/logs/sleep-cycle"))
 HEALTH_DELAYS = (0, 5, 15, 30)
+REQUEST_TIMEOUT_SEC = int(os.environ.get("BEE_SLEEP_REQUEST_TIMEOUT_SEC", "3300"))
 
 
 def _health() -> bool:
@@ -87,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         "mode": "health_check" if args.check else "sleep_cycle",
         "endpoint": _safe_endpoint(),
         "do_forget": False,
+        "request_timeout_s": REQUEST_TIMEOUT_SEC,
     }
     if DO_FORGET != "0":
         receipt.update(status="invalid_configuration", error_type="do_forget_not_authorized")
@@ -105,12 +108,23 @@ def main(argv: list[str] | None = None) -> int:
         BASE + f"/memory/sleep-cycle?do_forget={DO_FORGET}&render_vault=1",
         headers={"Authorization": f"Bearer {TOKEN}"}, method="POST")
     try:
-        r = json.loads(urllib.request.urlopen(req, timeout=600).read())
+        r = json.loads(urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SEC).read())
         receipt["status"] = "ok" if r.get("status") in {"ok", "skipped_already_running"} else "remote_failed"
         receipt["remote_status"] = r.get("status", "missing")
         if "elapsed_s" in r:
             receipt["remote_elapsed_s"] = r["elapsed_s"]
+        if "failed_step" in r:
+            receipt["remote_failed_step"] = r["failed_step"]
+        if "step_elapsed_s" in r:
+            receipt["remote_step_elapsed_s"] = r["step_elapsed_s"]
         return _finish(receipt, args.receipt_dir, 0 if receipt["status"] == "ok" else 1)
+    except (TimeoutError, socket.timeout) as e:
+        receipt.update(
+            status="request_timed_out_unknown_remote_state",
+            error_type=type(e).__name__,
+            error_message=str(e)[:240],
+        )
+        return _finish(receipt, args.receipt_dir, 1)
     except Exception as e:
         receipt.update(
             status="request_failed",

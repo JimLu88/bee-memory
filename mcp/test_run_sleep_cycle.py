@@ -44,7 +44,31 @@ def test_remote_call_is_not_retried(monkeypatch, tmp_path):
 
     assert runner.main(["--receipt-dir", str(tmp_path)]) == 1
     assert len(calls) == 1
-    assert _latest_receipt(tmp_path)["status"] == "request_failed"
+    receipt = _latest_receipt(tmp_path)
+    assert receipt["status"] == "request_timed_out_unknown_remote_state"
+    assert calls[0][1]["timeout"] == runner.REQUEST_TIMEOUT_SEC
+
+
+def test_remote_failure_preserves_stage_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner, "_wait_for_nas", lambda: (True, 1))
+
+    class Response:
+        def read(self):
+            return json.dumps({
+                "status": "failed",
+                "failed_step": "consolidate",
+                "elapsed_s": 75.5,
+                "step_elapsed_s": {"file_sync": 0.1, "distill": 0.2},
+            }).encode()
+
+    monkeypatch.setattr(runner.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+
+    assert runner.main(["--receipt-dir", str(tmp_path)]) == 1
+    receipt = _latest_receipt(tmp_path)
+    assert receipt["status"] == "remote_failed"
+    assert receipt["remote_failed_step"] == "consolidate"
+    assert receipt["remote_elapsed_s"] == 75.5
+    assert receipt["remote_step_elapsed_s"]["distill"] == 0.2
 
 
 def test_forget_mode_fails_closed(monkeypatch, tmp_path):

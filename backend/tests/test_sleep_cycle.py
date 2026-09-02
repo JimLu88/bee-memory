@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,41 @@ def test_sleep_cycle_full_run(db, tmp_path):
     assert (tmp_path / "vault" / "README.md").exists()
     assert list((tmp_path / "vault" / "concepts").glob("*.md")), "应有概念笔记"
     assert res["forget"]["dry_run"] is True
+    assert set(res["step_elapsed_s"]) >= {
+        "file_sync", "distill", "consolidate", "typed_edges", "backfill",
+        "stability_and_mocs", "vault", "forget", "backup",
+    }
+
+
+def test_consolidate_retries_only_transient_database_lock(monkeypatch):
+    attempts = []
+    sleeps = []
+
+    def operation():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return {"status": "ok"}
+
+    monkeypatch.setattr(sleep_cycle.time, "sleep", sleeps.append)
+    result = sleep_cycle._consolidate_with_lock_retry(operation)
+
+    assert result["status"] == "ok"
+    assert result["lock_attempts"] == 3
+    assert sleeps == [5, 15]
+
+
+def test_sleep_cycle_returns_failed_stage_and_releases_lock(db, monkeypatch):
+    def fail():
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(sleep_cycle.file_memory_sync, "sync_file_memories", fail)
+    result = sleep_cycle.run_sleep_cycle()
+
+    assert result["status"] == "failed"
+    assert result["failed_step"] == "file_sync"
+    assert result["error_type"] == "RuntimeError"
+    assert not (db.parent / ".sleep_cycle.lock").exists()
 
 
 def test_stability_filled(db):
