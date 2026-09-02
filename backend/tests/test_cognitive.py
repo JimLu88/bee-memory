@@ -630,3 +630,78 @@ def test_governed_supersede_closes_lifecycle(monkeypatch, tmp_path):
     assert old_review == "retired"
     assert new_parent == "old"
     assert conflict == ("resolved", "new")
+
+
+def test_dream_accessibility_is_idempotent_and_never_counts_for_promotion(monkeypatch, tmp_path):
+    _use_temp_db(monkeypatch, tmp_path)
+    evidence = [{"type": "note", "locator": "turn://verified", "excerpt": "fact"}]
+    with memory._conn() as conn:
+        _register_governed_memory(conn, "stable", tier="M1", verified=True, evidence=evidence)
+        _register_governed_memory(conn, "unstable", tier="M0", verified=False)
+    req = cognitive.DreamAccessibilityRequest(
+        dream_note_id="dream-test-1",
+        dream_date="2026-09-02",
+        mentions=[
+            {"memory_id": "stable", "phase_count": 3, "segment_count": 3},
+            {"memory_id": "unstable", "phase_count": 1, "segment_count": 1},
+        ],
+    )
+
+    first = cognitive.record_dream_accessibility(req)
+    second = cognitive.record_dream_accessibility(req)
+
+    assert first["accepted"][0]["base_delta"] == 0.035
+    assert first["accepted"][0]["deduplicated"] is False
+    assert first["rejected"] == [{"memory_id": "unstable", "reason": "stable_tier_required"}]
+    assert second["accepted"][0]["deduplicated"] is True
+    with memory._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM memory_dream_accessibility_events WHERE memory_id='stable'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT activation_count,adopted_count,confirmed_count,memory_tier,confidence "
+            "FROM memory_cognitive WHERE memory_id='stable'"
+        ).fetchone() == (0, 0, 0, "M1", 0.7)
+
+
+def test_dream_accessibility_decays_caps_and_only_reranks_when_enabled(monkeypatch, tmp_path):
+    _use_temp_db(monkeypatch, tmp_path)
+    evidence = [{"type": "note", "locator": "turn://verified", "excerpt": "fact"}]
+    with memory._conn() as conn:
+        _register_governed_memory(conn, "dreamed", tier="M1", verified=True, evidence=evidence)
+        _register_governed_memory(conn, "plain", tier="M1", verified=True, evidence=evidence)
+    for index in range(6):
+        result = cognitive.record_dream_accessibility(cognitive.DreamAccessibilityRequest(
+            dream_note_id=f"dream-cap-{index}",
+            dream_date="2026-09-02",
+            mentions=[{"memory_id": "dreamed", "phase_count": 3, "segment_count": 3}],
+        ))
+        assert result["ok"] is True
+    with memory._conn() as conn:
+        now_boost = cognitive._dream_accessibility_map(conn, ["dreamed"], on_date="2026-09-02")
+        half_boost = cognitive._dream_accessibility_map(conn, ["dreamed"], on_date="2026-10-02")
+    assert now_boost["dreamed"] == 0.12
+    assert half_boost["dreamed"] == pytest.approx(0.105, abs=0.002)
+
+    candidates = [
+        {"id": "plain", "kind": "semantic", "score": 0.03, "rrf_score": 0.03,
+         "snippet": "plain", "token_count": 20, "via": "lexical"},
+        {"id": "dreamed", "kind": "semantic", "score": 0.03, "rrf_score": 0.03,
+         "snippet": "dreamed", "token_count": 20, "via": "lexical"},
+    ]
+    monkeypatch.setattr(cognitive, "_rrf_candidates", lambda *args, **kwargs: (
+        candidates, {"channels": {"test": 2}, "partial": False,
+                     "stop_reason": "complete", "candidate_audit": []},
+    ))
+    enabled = cognitive.recall_planned(cognitive.PlannedRecallRequest(
+        query="same", depth="L2", apply_dream_accessibility=True,
+    ))
+    disabled = cognitive.recall_planned(cognitive.PlannedRecallRequest(
+        query="same", depth="L2", apply_dream_accessibility=False,
+    ))
+
+    assert enabled["items"][0]["id"] == "dreamed"
+    assert enabled["items"][0]["dream_accessibility_boost"] > 0
+    assert "梦境可达性" in enabled["items"][0]["why_recalled"]
+    assert disabled["items"][0]["id"] == "plain"
+    assert all(item["dream_accessibility_boost"] == 0 for item in disabled["items"])

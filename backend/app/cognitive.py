@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -16,6 +17,7 @@ import threading
 import time
 import uuid
 from collections import Counter
+from datetime import date
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -273,6 +275,22 @@ def ensure_cognitive_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_memory_activations_gate
           ON memory_activations(memory_id,activation_kind,occurred_date,session_id);
+        CREATE TABLE IF NOT EXISTS memory_dream_accessibility_events (
+          event_id TEXT PRIMARY KEY,
+          memory_id TEXT NOT NULL,
+          dream_note_id TEXT NOT NULL,
+          occurred_date TEXT NOT NULL,
+          phase_count INTEGER NOT NULL,
+          segment_count INTEGER NOT NULL,
+          base_delta REAL NOT NULL,
+          evidence_locator TEXT NOT NULL,
+          principal_type TEXT NOT NULL,
+          principal_id TEXT NOT NULL,
+          created_ts INTEGER NOT NULL,
+          UNIQUE(memory_id,dream_note_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_dream_accessibility
+          ON memory_dream_accessibility_events(memory_id,occurred_date);
         CREATE TABLE IF NOT EXISTS hippocampal_inbox (
           episode_id TEXT PRIMARY KEY,
           idempotency_key TEXT NOT NULL UNIQUE,
@@ -675,6 +693,18 @@ class ActivationRequest(BaseModel):
     idempotency_key: str = ""
 
 
+class DreamAccessibilityMention(BaseModel):
+    memory_id: str = Field(min_length=1, max_length=160)
+    phase_count: int = Field(default=1, ge=1, le=3)
+    segment_count: int = Field(default=1, ge=1, le=3)
+
+
+class DreamAccessibilityRequest(BaseModel):
+    dream_note_id: str = Field(min_length=1, max_length=160)
+    dream_date: str = Field(min_length=10, max_length=10)
+    mentions: list[DreamAccessibilityMention] = Field(default_factory=list)
+
+
 class ConflictReviewRequest(BaseModel):
     conflict_id: str = Field(min_length=1, max_length=160)
     resolution: str = "needs_more_evidence"
@@ -890,6 +920,94 @@ def record_governed_activation(req: ActivationRequest,
         "activation_count": int(counts[0] or 0),
         "distinct_dates": int(counts[3] or 0),
         "distinct_sessions": int(counts[4] or 0),
+    }
+
+
+_DREAM_ACCESSIBILITY_DELTA = {1: 0.020, 2: 0.028, 3: 0.035}
+_DREAM_ACCESSIBILITY_HALF_LIFE_DAYS = 30.0
+_DREAM_ACCESSIBILITY_CAP = 0.12
+
+
+@router.post("/governance/dream-accessibility")
+def record_dream_accessibility(req: DreamAccessibilityRequest,
+                               request: Request = None) -> dict[str, Any]:
+    """Record bounded dream salience without changing truth or promotion state."""
+    from .memory import _conn
+
+    try:
+        occurred_date = date.fromisoformat(req.dream_date).isoformat()
+    except ValueError as exc:
+        raise HTTPException(400, "dream_date must use YYYY-MM-DD") from exc
+    if len(req.mentions) > 16:
+        raise HTTPException(400, "at most 16 dream mentions are accepted")
+    principal = _request_principal(request)
+    now = _now()
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    with _conn() as conn:
+        candidate_ids = {item.memory_id for item in req.mentions}
+        allowed = _allowed_memory_ids(
+            conn,
+            principal_type=principal["principal_type"],
+            principal_id=principal["principal_id"],
+            roles=principal["roles"],
+            candidate_ids=candidate_ids,
+        )
+        for item in req.mentions:
+            row = conn.execute(
+                "SELECT memory_tier,verification_status,review_status,status "
+                "FROM memory_cognitive WHERE memory_id=?",
+                (item.memory_id,),
+            ).fetchone()
+            reason = ""
+            if item.memory_id not in allowed:
+                reason = "acl_denied"
+            elif not row:
+                reason = "governance_row_missing"
+            elif str(row[0] or "M0") not in {"M1", "M2", "M3"}:
+                reason = "stable_tier_required"
+            elif str(row[1] or "unreviewed") != "verified":
+                reason = "verified_memory_required"
+            elif str(row[2] or "quarantine") != "active" or str(row[3] or "active") != "active":
+                reason = "active_memory_required"
+            if reason:
+                rejected.append({"memory_id": item.memory_id, "reason": reason})
+                continue
+            delta = _DREAM_ACCESSIBILITY_DELTA[item.phase_count]
+            seed = f"{req.dream_note_id}|{item.memory_id}"
+            event_id = "dream-access-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+            before = conn.total_changes
+            conn.execute(
+                """INSERT OR IGNORE INTO memory_dream_accessibility_events(
+                     event_id,memory_id,dream_note_id,occurred_date,phase_count,
+                     segment_count,base_delta,evidence_locator,principal_type,
+                     principal_id,created_ts
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    event_id, item.memory_id, req.dream_note_id, occurred_date,
+                    item.phase_count, item.segment_count, delta,
+                    f"dream:{req.dream_note_id}", principal["principal_type"],
+                    principal["principal_id"], now,
+                ),
+            )
+            accepted.append({
+                "memory_id": item.memory_id,
+                "event_id": event_id,
+                "base_delta": delta,
+                "deduplicated": conn.total_changes == before,
+            })
+    return {
+        "ok": True,
+        "dream_note_id": req.dream_note_id,
+        "dream_date": occurred_date,
+        "accepted": accepted,
+        "rejected": rejected,
+        "policy": {
+            "half_life_days": int(_DREAM_ACCESSIBILITY_HALF_LIFE_DAYS),
+            "cumulative_cap": _DREAM_ACCESSIBILITY_CAP,
+            "changes_truth_state": False,
+            "counts_for_promotion": False,
+        },
     }
 
 
@@ -1514,6 +1632,7 @@ class PlannedRecallRequest(BaseModel):
     session_id: str = ""
     include_books: bool = False
     include_hypotheses: bool = False
+    apply_dream_accessibility: bool = True
     touch: bool = True
 
 
@@ -1528,6 +1647,31 @@ def _facet_map(conn: sqlite3.Connection, ids: list[str]) -> dict[str, dict[str, 
     ):
         result.setdefault(str(memory_id), {}).setdefault(str(facet_type), []).append(str(facet_value))
     return result
+
+
+def _dream_accessibility_map(conn: sqlite3.Connection, ids: list[str],
+                             *, on_date: str = "") -> dict[str, float]:
+    """Return the decayed and capped accessibility boost for candidate IDs."""
+    if not ids:
+        return {}
+    selected_date = date.fromisoformat(on_date) if on_date else date.today()
+    placeholders = ",".join("?" for _ in ids)
+    totals: dict[str, float] = {}
+    for memory_id, occurred_date, base_delta in conn.execute(
+        f"SELECT memory_id,occurred_date,base_delta "
+        f"FROM memory_dream_accessibility_events WHERE memory_id IN ({placeholders})",
+        ids,
+    ):
+        try:
+            age_days = (selected_date - date.fromisoformat(str(occurred_date))).days
+        except ValueError:
+            continue
+        if age_days < 0:
+            continue
+        decayed = float(base_delta) * math.pow(0.5, age_days / _DREAM_ACCESSIBILITY_HALF_LIFE_DAYS)
+        key = str(memory_id)
+        totals[key] = totals.get(key, 0.0) + decayed
+    return {key: min(_DREAM_ACCESSIBILITY_CAP, value) for key, value in totals.items()}
 
 
 @router.post("/recall-planned")
@@ -1577,6 +1721,10 @@ def recall_planned(req: PlannedRecallRequest,
                 f"SELECT * FROM memory_cognitive WHERE memory_id IN ({placeholders})", ids
             )}
         facets = _facet_map(conn, ids)
+        dream_accessibility = (
+            _dream_accessibility_map(conn, ids)
+            if req.apply_dream_accessibility else {}
+        )
         evidence_map: dict[str, list[dict[str, Any]]] = {}
         conflict_map: dict[str, list[dict[str, Any]]] = {}
         if ids:
@@ -1642,6 +1790,8 @@ def recall_planned(req: PlannedRecallRequest,
             multiplier += (confidence - 0.5) * 0.04
             if req.project and req.project.casefold() in set(row_facets.get("project", [])):
                 multiplier += 0.04
+            dream_boost = float(dream_accessibility.get(memory_id, 0.0))
+            multiplier += dream_boost
             open_conflicts = conflict_map.get(memory_id, [])
             if open_conflicts:
                 multiplier *= 0.90
@@ -1652,6 +1802,8 @@ def recall_planned(req: PlannedRecallRequest,
             explanation += [f"实体:{x}" for x in sorted(entity_hits)]
             if form_hit:
                 explanation.append(f"记忆类型:{memory_form}")
+            if dream_boost > 0:
+                explanation.append("梦境可达性")
             ranked.append({**item, "score": round(score, 4), "memory_form": memory_form,
                            "lifecycle_stage": stage,
                            "memory_tier": memory_tier,
@@ -1665,7 +1817,9 @@ def recall_planned(req: PlannedRecallRequest,
                            "parent_memory_id": str(meta.get("parent_memory_id") or ""),
                            "evidence": evidence_map.get(memory_id, []),
                             "open_conflicts": open_conflicts,
-                            "score_multiplier": round(multiplier, 4)})
+                             "dream_accessibility_boost": round(dream_boost, 6),
+                             "dream_accessibility_multiplier": round(1.0 + dream_boost, 6),
+                             "score_multiplier": round(multiplier, 4)})
         ranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
         chosen: list[dict[str, Any]] = []
         used_tokens = 0
@@ -1780,6 +1934,7 @@ def recall_planned(req: PlannedRecallRequest,
             "retrieval_path": [
                 "acl_filter",
                 "fts5_bm25", "vector", "rrf", "bounded_graph",
+                *(["dream_accessibility"] if req.apply_dream_accessibility else []),
                 "governance", "coverage_and_budget",
             ],
             "retrieval": {**channel_trace,
@@ -1839,6 +1994,9 @@ def cognitive_stats() -> dict[str, Any]:
         activations = {str(k): int(v) for k, v in conn.execute(
             "SELECT activation_kind,COUNT(*) FROM memory_activations GROUP BY activation_kind"
         )}
+        dream_accessibility_events = int(conn.execute(
+            "SELECT COUNT(*) FROM memory_dream_accessibility_events"
+        ).fetchone()[0])
     for row in recent:
         row["source_counts"] = _json(row.pop("source_counts_json", "{}"), {})
     classified = sum(forms.values())
@@ -1855,6 +2013,8 @@ def cognitive_stats() -> dict[str, Any]:
                 "verification": verification,
                 "shared_state_versions": state_rows,
                 "retrieval_fusion": "rrf-v1",
+                "dream_accessibility_events": dream_accessibility_events,
+                "dream_accessibility_counts_for_promotion": False,
                 "acl_before_recall": True,
                 "hot_fts_rows": hot_fts_rows,
                 "hot_fts_depths": ["Q1", "Q2"],
