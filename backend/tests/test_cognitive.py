@@ -705,3 +705,43 @@ def test_dream_accessibility_decays_caps_and_only_reranks_when_enabled(monkeypat
     assert "梦境可达性" in enabled["items"][0]["why_recalled"]
     assert disabled["items"][0]["id"] == "plain"
     assert all(item["dream_accessibility_boost"] == 0 for item in disabled["items"])
+
+
+def test_quiet_dream_seed_recall_is_acl_filtered_stable_deterministic_and_read_only(
+    monkeypatch, tmp_path,
+):
+    _use_temp_db(monkeypatch, tmp_path)
+    evidence = [{"type": "note", "locator": "turn://verified", "excerpt": "fact"}]
+    with memory._conn() as conn:
+        _register_governed_memory(conn, "stable-a", tier="M1", verified=True, evidence=evidence)
+        _register_governed_memory(conn, "stable-b", tier="M3", verified=True, evidence=evidence)
+        _register_governed_memory(conn, "unstable", tier="M0", verified=False)
+        _register_governed_memory(conn, "other-owner", tier="M2", verified=True, evidence=evidence)
+        conn.execute(
+            "UPDATE memory_cognitive SET owner_id='someone-else' WHERE memory_id='other-owner'"
+        )
+        conn.execute("DELETE FROM memory_acl WHERE memory_id='other-owner'")
+        before = conn.execute(
+            "SELECT id,last_recall_ts,recall_count FROM memories ORDER BY id"
+        ).fetchall()
+
+    request = cognitive.DreamSeedRecallRequest(seed="night-dream:2026-09-02", limit=4)
+    first = cognitive.recall_dream_seeds(request)
+    second = cognitive.recall_dream_seeds(request)
+
+    assert [item["id"] for item in first["items"]] == [item["id"] for item in second["items"]]
+    assert {item["id"] for item in first["items"]} == {"stable-a", "stable-b"}
+    assert all(item["verification_status"] == "verified" for item in first["items"])
+    assert all(item["memory_tier"] in {"M1", "M2", "M3"} for item in first["items"])
+    assert first["touch"] is False
+    assert first["apply_dream_accessibility"] is False
+    assert first["retrieval"]["acl_enforced"] is True
+    with memory._conn() as conn:
+        after = conn.execute(
+            "SELECT id,last_recall_ts,recall_count FROM memories ORDER BY id"
+        ).fetchall()
+        accessibility_events = conn.execute(
+            "SELECT COUNT(*) FROM memory_dream_accessibility_events"
+        ).fetchone()[0]
+    assert after == before
+    assert accessibility_events == 0

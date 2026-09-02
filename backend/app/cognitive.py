@@ -705,6 +705,12 @@ class DreamAccessibilityRequest(BaseModel):
     mentions: list[DreamAccessibilityMention] = Field(default_factory=list)
 
 
+class DreamSeedRecallRequest(BaseModel):
+    seed: str = Field(min_length=1, max_length=160)
+    limit: int = Field(default=4, ge=1, le=8)
+    max_chars: int = Field(default=2800, ge=400, le=4000)
+
+
 class ConflictReviewRequest(BaseModel):
     conflict_id: str = Field(min_length=1, max_length=160)
     resolution: str = "needs_more_evidence"
@@ -926,6 +932,105 @@ def record_governed_activation(req: ActivationRequest,
 _DREAM_ACCESSIBILITY_DELTA = {1: 0.020, 2: 0.028, 3: 0.035}
 _DREAM_ACCESSIBILITY_HALF_LIFE_DAYS = 30.0
 _DREAM_ACCESSIBILITY_CAP = 0.12
+
+
+@router.post("/recall-dream-seeds")
+def recall_dream_seeds(req: DreamSeedRecallRequest,
+                       request: Request = None) -> dict[str, Any]:
+    """Return a deterministic random sample of stable memories for a quiet night.
+
+    Candidate IDs are filtered by governance and ACL before content is fetched.
+    The endpoint is deliberately read-only: it neither records recall nor applies
+    prior dream accessibility while selecting the next dream's source material.
+    """
+    from .memory import _conn
+
+    principal = _request_principal(request)
+    with _conn() as conn:
+        conn.row_factory = sqlite3.Row
+        candidate_ids = {
+            str(row[0]) for row in conn.execute(
+                """SELECT c.memory_id
+                   FROM memory_cognitive AS c
+                   JOIN memories AS m ON m.id=c.memory_id
+                   WHERE m.invalid_at IS NULL
+                     AND c.memory_tier IN ('M1','M2','M3')
+                     AND c.verification_status='verified'
+                     AND c.review_status='active'
+                     AND c.status='active'
+                     AND c.memory_form!='hypothesis'
+                   ORDER BY COALESCE(m.last_recall_ts,0),c.memory_id
+                   LIMIT 512"""
+            ).fetchall()
+        }
+        allowed = _allowed_memory_ids(
+            conn,
+            principal_type=principal["principal_type"],
+            principal_id=principal["principal_id"],
+            roles=principal["roles"],
+            candidate_ids=candidate_ids,
+        )
+        if not allowed:
+            return {
+                "ok": True, "items": [], "candidate_count": 0,
+                "selection": "deterministic_seeded_stable_memory",
+                "touch": False, "apply_dream_accessibility": False,
+            }
+        placeholders = ",".join("?" for _ in allowed)
+        rows = [dict(row) for row in conn.execute(
+            f"""SELECT m.id,m.kind,m.content,m.importance,m.meta,
+                       c.memory_form,c.lifecycle_stage,c.memory_tier,
+                       c.verification_status,c.review_status,c.source,c.source_id
+                FROM memories AS m
+                JOIN memory_cognitive AS c ON c.memory_id=m.id
+                WHERE m.id IN ({placeholders})""",
+            sorted(allowed),
+        ).fetchall()]
+
+    rows.sort(key=lambda row: hashlib.sha256(
+        f"{req.seed}|{row['id']}".encode("utf-8")
+    ).hexdigest())
+    items: list[dict[str, Any]] = []
+    used_chars = 0
+    for row in rows:
+        remaining = req.max_chars - used_chars
+        if remaining <= 0 or len(items) >= req.limit:
+            break
+        snippet = str(row.get("content") or "").strip()[: min(700, remaining)]
+        if not snippet:
+            continue
+        items.append({
+            "id": str(row["id"]),
+            "memory_id": str(row["id"]),
+            "kind": str(row.get("kind") or ""),
+            "snippet": snippet,
+            "content": snippet,
+            "importance": int(row.get("importance") or 0),
+            "memory_form": str(row.get("memory_form") or ""),
+            "lifecycle_stage": str(row.get("lifecycle_stage") or ""),
+            "memory_tier": str(row.get("memory_tier") or "M0"),
+            "verification_status": str(row.get("verification_status") or "unreviewed"),
+            "review_status": str(row.get("review_status") or "quarantine"),
+            "source": str(row.get("source") or ""),
+            "source_id": str(row.get("source_id") or ""),
+            "dream_accessibility_boost": 0.0,
+        })
+        used_chars += len(snippet)
+    return {
+        "ok": True,
+        "items": items,
+        "candidate_count": len(allowed),
+        "char_count": used_chars,
+        "selection": "deterministic_seeded_stable_memory",
+        "touch": False,
+        "apply_dream_accessibility": False,
+        "retrieval": {
+            "principal_type": principal["principal_type"],
+            "principal_id": principal["principal_id"],
+            "identity_source": principal["identity_source"],
+            "acl_enforced": True,
+        },
+    }
 
 
 @router.post("/governance/dream-accessibility")
