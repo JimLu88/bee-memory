@@ -20,6 +20,9 @@ def test_check_is_read_only_and_writes_receipt(monkeypatch, tmp_path):
     assert receipt["mode"] == "health_check"
     assert receipt["status"] == "healthy"
     assert receipt["do_forget"] is False
+    assert receipt["full_reindex"] is False
+    assert receipt["backfill_limit"] == 64
+    assert receipt["run_backup"] is False
 
 
 def test_nas_failure_never_starts_local_backend(monkeypatch, tmp_path):

@@ -560,13 +560,23 @@ def add_edge(req: EdgeIn) -> dict:
 
 
 @router.post("/consolidate")
-def consolidate(promote_threshold: int = 3) -> dict:
+def consolidate(promote_threshold: int = 3, full_reindex: bool = True) -> dict:
     """v4 结构固化 (睡眠循环的非 LLM 部分):
     1. 重建概念图 + 记忆↔记忆共现边 (给扩散激活加油);
     2. 把被反复引用的 dangling link 提升为正式概念 (Obsidian 自动立节点);
     3. 返回真实统计. LLM 语义蒸馏 (episodic→semantic) 留 P3.
     """
-    idx = associative.reindex_concepts(rebuild_edges=True)
+    # Normal stores already update FTS and concept membership incrementally.
+    # A multi-GB full rebuild is therefore an explicit maintenance operation,
+    # not part of the daily sleep path.
+    idx = (
+        associative.reindex_concepts(rebuild_edges=True)
+        if full_reindex
+        else {
+            "status": "skipped_daily_incremental",
+            "reason": "full_reindex_requires_explicit_maintenance",
+        }
+    )
     promoted = 0
     with _conn() as c:
         # dangling 引用够多 且已有同名概念 → 标记 promoted
@@ -583,6 +593,7 @@ def consolidate(promote_threshold: int = 3) -> dict:
     return {
         "status": "ok",
         "reindex": idx,
+        "full_reindex": bool(full_reindex),
         "dangling_promoted": promoted,
         "note": "结构固化完成; LLM 语义蒸馏留 P3 睡眠循环",
     }

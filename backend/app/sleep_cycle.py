@@ -1,7 +1,7 @@
 """睡眠循环 (v4 记忆大脑 P3) — 夜间离线固化, 对应 CLS 的新皮层慢学 + Letta sleep-agent.
 
 每晚跑一次 (调度见 mcp/register_schedule.ps1). 步骤 (全部 LLM-free, 可离线):
-1. reindex     重建概念图 + 记忆↔记忆共现边 (给扩散激活加油)
+1. consolidate 日常只处理增量索引后的 dangling link；全库 reindex 需显式维护
 2. backfill    给新记忆补 bge-m3 向量
 3. dangling    被反复引用的 [[链接]] 提升为正式概念
 4. stability   FSRS 式更新存储强度 S (importance + log(recall_count)); 顺带填 difficulty
@@ -451,8 +451,14 @@ def _run_step(out: dict[str, Any], name: str, operation) -> Any:
     return value
 
 
-def run_sleep_cycle(do_forget: bool = False, render_vault: bool = True) -> dict[str, Any]:
-    """完整睡眠循环. do_forget=False 时只报告遗忘候选不删 (安全默认). 单实例串行."""
+def run_sleep_cycle(
+    do_forget: bool = False,
+    render_vault: bool = True,
+    full_reindex: bool = False,
+    backfill_limit: int = 64,
+    run_backup: bool = False,
+) -> dict[str, Any]:
+    """日常睡眠循环；全库 reindex 只在显式维护窗口启用。"""
     acq = _acquire_lock()
     if acq is None:
         return {"status": "skipped_already_running"}
@@ -467,11 +473,16 @@ def run_sleep_cycle(do_forget: bool = False, render_vault: bool = True) -> dict[
         current_step = "distill"
         _run_step(out, current_step, _distill_episodics)       # 0a episodic→semantic
         current_step = "consolidate"
-        _run_step(out, current_step, lambda: _consolidate_with_lock_retry(consolidate))
+        _run_step(
+            out,
+            current_step,
+            lambda: _consolidate_with_lock_retry(
+                lambda: consolidate(full_reindex=full_reindex)),
+        )
         current_step = "typed_edges"
         _run_step(out, current_step, _typed_edges)             # 0b 类型化边
         current_step = "backfill"
-        _run_step(out, current_step, semantic.backfill)        # 2 补嵌入
+        _run_step(out, current_step, lambda: semantic.backfill(limit=max(0, int(backfill_limit))))
         current_step = "stability_and_mocs"
         step_started = time.monotonic()
         with _conn() as c:
@@ -488,7 +499,13 @@ def run_sleep_cycle(do_forget: bool = False, render_vault: bool = True) -> dict[
         _run_step(out, current_step, lambda: forget(
             ForgetIn(below_activation=0.05, dry_run=not do_forget, max_delete=100)))
         current_step = "backup"
-        _run_step(out, current_step, _backup)
+        if run_backup:
+            _run_step(out, current_step, _backup)
+        else:
+            _run_step(out, current_step, lambda: {
+                "status": "skipped_daily_incremental",
+                "reason": "full_backup_requires_explicit_maintenance",
+            })
         out["status"] = "ok"
         out["elapsed_s"] = round(time.time() - t0, 1)
     except Exception as exc:

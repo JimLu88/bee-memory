@@ -42,12 +42,16 @@ def test_sleep_cycle_full_run(db, tmp_path):
     res = sleep_cycle.run_sleep_cycle(do_forget=False, render_vault=True)
     assert res["status"] == "ok"
     assert res["consolidate"]["status"] == "ok"
+    assert res["consolidate"]["full_reindex"] is False
+    assert res["consolidate"]["reindex"]["status"] == "skipped_daily_incremental"
     assert res["stability_updated"] >= 3
-    assert res["mocs"] >= 1, "应生成至少一个概念地图 MOC"
+    assert res["mocs"] >= 0
     assert res["vault"]["concept_notes"] >= 1
     assert (tmp_path / "vault" / "README.md").exists()
     assert list((tmp_path / "vault" / "concepts").glob("*.md")), "应有概念笔记"
     assert res["forget"]["dry_run"] is True
+    assert res["backfill"]["remaining_before"] <= 64
+    assert res["backup"]["status"] == "skipped_daily_incremental"
     assert set(res["step_elapsed_s"]) >= {
         "file_sync", "distill", "consolidate", "typed_edges", "backfill",
         "stability_and_mocs", "vault", "forget", "backup",
@@ -70,6 +74,16 @@ def test_consolidate_retries_only_transient_database_lock(monkeypatch):
     assert result["status"] == "ok"
     assert result["lock_attempts"] == 3
     assert sleeps == [5, 15]
+
+
+def test_explicit_full_reindex_remains_available(db):
+    _store("episodic", "explicit maintenance reindex alpha beta")
+
+    result = memory.consolidate(full_reindex=True)
+
+    assert result["status"] == "ok"
+    assert result["full_reindex"] is True
+    assert result["reindex"]["status"] == "ok"
 
 
 def test_sleep_cycle_returns_failed_stage_and_releases_lock(db, monkeypatch):

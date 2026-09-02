@@ -914,13 +914,25 @@ def sync_file_memories_endpoint() -> dict:
 
 
 @router.post("/sleep-cycle")
-def sleep_cycle_endpoint(do_forget: int = 0, render_vault: int = 1) -> dict:
-    """P3 睡眠循环: reindex+补嵌入+dangling提升+stability+MOC+vault渲染+遗忘(默认dry_run).
+def sleep_cycle_endpoint(
+    do_forget: int = 0,
+    render_vault: int = 1,
+    full_reindex: int = 0,
+    backfill_limit: int = 64,
+    run_backup: int = 0,
+) -> dict:
+    """P3 日常睡眠循环；全库 reindex 默认关闭，仅供显式维护窗口启用。
 
     夜间调度调这个 (register_schedule.ps1). do_forget=0 只报告遗忘候选不删.
     """
     from . import sleep_cycle
-    return sleep_cycle.run_sleep_cycle(do_forget=bool(do_forget), render_vault=bool(render_vault))
+    return sleep_cycle.run_sleep_cycle(
+        do_forget=bool(do_forget),
+        render_vault=bool(render_vault),
+        full_reindex=bool(full_reindex),
+        backfill_limit=max(0, min(int(backfill_limit), 1000)),
+        run_backup=bool(run_backup),
+    )
 
 
 class InvalidateIn(BaseModel):

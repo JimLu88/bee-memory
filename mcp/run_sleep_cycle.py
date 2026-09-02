@@ -89,6 +89,9 @@ def main(argv: list[str] | None = None) -> int:
         "mode": "health_check" if args.check else "sleep_cycle",
         "endpoint": _safe_endpoint(),
         "do_forget": False,
+        "full_reindex": False,
+        "backfill_limit": 64,
+        "run_backup": False,
         "request_timeout_s": REQUEST_TIMEOUT_SEC,
     }
     if DO_FORGET != "0":
@@ -105,7 +108,8 @@ def main(argv: list[str] | None = None) -> int:
         return _finish(receipt, args.receipt_dir, 0)
 
     req = urllib.request.Request(
-        BASE + f"/memory/sleep-cycle?do_forget={DO_FORGET}&render_vault=1",
+        BASE + f"/memory/sleep-cycle?do_forget={DO_FORGET}&render_vault=1"
+        "&full_reindex=0&backfill_limit=64&run_backup=0",
         headers={"Authorization": f"Bearer {TOKEN}"}, method="POST")
     try:
         r = json.loads(urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SEC).read())
