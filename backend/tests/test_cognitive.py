@@ -733,9 +733,47 @@ def test_quiet_dream_seed_recall_is_acl_filtered_stable_deterministic_and_read_o
     assert {item["id"] for item in first["items"]} == {"stable-a", "stable-b"}
     assert all(item["verification_status"] == "verified" for item in first["items"])
     assert all(item["memory_tier"] in {"M1", "M2", "M3"} for item in first["items"])
+    assert first["governance_pool"] == "verified_stable"
+    assert first["reinforcement_eligible"] is True
+    assert all(item["dream_reinforcement_eligible"] is True for item in first["items"])
     assert first["touch"] is False
     assert first["apply_dream_accessibility"] is False
     assert first["retrieval"]["acl_enforced"] is True
+    with memory._conn() as conn:
+        after = conn.execute(
+            "SELECT id,last_recall_ts,recall_count FROM memories ORDER BY id"
+        ).fetchall()
+        accessibility_events = conn.execute(
+            "SELECT COUNT(*) FROM memory_dream_accessibility_events"
+        ).fetchone()[0]
+    assert after == before
+    assert accessibility_events == 0
+
+
+def test_quiet_dream_seed_recall_uses_acl_filtered_legacy_pool_without_reinforcement(
+    monkeypatch, tmp_path,
+):
+    _use_temp_db(monkeypatch, tmp_path)
+    with memory._conn() as conn:
+        _register_governed_memory(conn, "legacy-owned", tier="M0", verified=False)
+        _register_governed_memory(conn, "legacy-other", tier="M0", verified=False)
+        conn.execute(
+            "UPDATE memory_cognitive SET owner_id='someone-else' WHERE memory_id='legacy-other'"
+        )
+        conn.execute("DELETE FROM memory_acl WHERE memory_id='legacy-other'")
+        before = conn.execute(
+            "SELECT id,last_recall_ts,recall_count FROM memories ORDER BY id"
+        ).fetchall()
+
+    result = cognitive.recall_dream_seeds(
+        cognitive.DreamSeedRecallRequest(seed="night-dream:legacy", limit=4)
+    )
+
+    assert [item["id"] for item in result["items"]] == ["legacy-owned"]
+    assert result["governance_pool"] == "legacy_unverified_dream_only"
+    assert result["reinforcement_eligible"] is False
+    assert result["items"][0]["dream_reinforcement_eligible"] is False
+    assert result["items"][0]["verification_status"] == "unreviewed"
     with memory._conn() as conn:
         after = conn.execute(
             "SELECT id,last_recall_ts,recall_count FROM memories ORDER BY id"

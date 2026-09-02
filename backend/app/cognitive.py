@@ -424,6 +424,11 @@ def ensure_cognitive_schema(conn: sqlite3.Connection) -> None:
         "ON memory_cognitive(visibility,owner_type,owner_id,review_status,memory_tier)"
     )
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cognitive_dream_pool "
+        "ON memory_cognitive(verification_status,review_status,status,"
+        "memory_tier,memory_form,memory_id)"
+    )
+    conn.execute(
         "INSERT OR IGNORE INTO cognitive_migrations(name,completed_ts) VALUES (?,?)",
         ("lazy_existing_v1", _now()),
     )
@@ -948,32 +953,68 @@ def recall_dream_seeds(req: DreamSeedRecallRequest,
     principal = _request_principal(request)
     with _conn() as conn:
         conn.row_factory = sqlite3.Row
-        candidate_ids = {
-            str(row[0]) for row in conn.execute(
-                """SELECT c.memory_id
-                   FROM memory_cognitive AS c
-                   JOIN memories AS m ON m.id=c.memory_id
-                   WHERE m.invalid_at IS NULL
-                     AND c.memory_tier IN ('M1','M2','M3')
-                     AND c.verification_status='verified'
-                     AND c.review_status='active'
-                     AND c.status='active'
-                     AND c.memory_form!='hypothesis'
-                   ORDER BY COALESCE(m.last_recall_ts,0),c.memory_id
-                   LIMIT 512"""
-            ).fetchall()
-        }
-        allowed = _allowed_memory_ids(
-            conn,
-            principal_type=principal["principal_type"],
-            principal_id=principal["principal_id"],
-            roles=principal["roles"],
-            candidate_ids=candidate_ids,
-        )
+        forms = sorted(MEMORY_FORMS - {"hypothesis"})
+
+        def candidate_pool(*, tiers: tuple[str, ...], verification: str,
+                           review: str) -> set[str]:
+            # Every lookup fixes the complete leading edge of the covering
+            # index.  This keeps empty and sparse pools bounded on a large
+            # database and avoids a full memories scan or temporary sort.
+            bucket_limit = max(1, math.ceil(512 / (len(tiers) * len(forms))))
+            values: set[str] = set()
+            for tier in tiers:
+                for memory_form in forms:
+                    values.update(
+                        str(row[0]) for row in conn.execute(
+                            """SELECT memory_id
+                               FROM memory_cognitive INDEXED BY idx_cognitive_dream_pool
+                               WHERE verification_status=? AND review_status=?
+                                 AND status='active' AND memory_tier=? AND memory_form=?
+                               ORDER BY memory_id LIMIT ?""",
+                            (verification, review, tier, memory_form, bucket_limit),
+                        ).fetchall()
+                    )
+            return set(sorted(
+                values,
+                key=lambda value: hashlib.sha256(
+                    f"{req.seed}|pool|{value}".encode("utf-8")
+                ).hexdigest(),
+            )[:512])
+
+        def acl_filter(candidate_ids: set[str]) -> set[str]:
+            return _allowed_memory_ids(
+                conn,
+                principal_type=principal["principal_type"],
+                principal_id=principal["principal_id"],
+                roles=principal["roles"],
+                candidate_ids=candidate_ids,
+            )
+
+        governance_pool = "verified_stable"
+        reinforcement_eligible = True
+        allowed = acl_filter(candidate_pool(
+            tiers=("M1", "M2", "M3"),
+            verification="verified",
+            review="active",
+        ))
+        if not allowed:
+            # Legacy memories are permitted only as private dream imagery when
+            # no governed stable memory exists.  They remain unverified M0,
+            # cannot receive accessibility reinforcement, and never become
+            # factual evidence merely by appearing in a dream.
+            governance_pool = "legacy_unverified_dream_only"
+            reinforcement_eligible = False
+            allowed = acl_filter(candidate_pool(
+                tiers=("M0",),
+                verification="unreviewed",
+                review="quarantine",
+            ))
         if not allowed:
             return {
                 "ok": True, "items": [], "candidate_count": 0,
                 "selection": "deterministic_seeded_stable_memory",
+                "governance_pool": "none",
+                "reinforcement_eligible": False,
                 "touch": False, "apply_dream_accessibility": False,
             }
         placeholders = ",".join("?" for _ in allowed)
@@ -1014,6 +1055,7 @@ def recall_dream_seeds(req: DreamSeedRecallRequest,
             "source": str(row.get("source") or ""),
             "source_id": str(row.get("source_id") or ""),
             "dream_accessibility_boost": 0.0,
+            "dream_reinforcement_eligible": reinforcement_eligible,
         })
         used_chars += len(snippet)
     return {
@@ -1022,6 +1064,8 @@ def recall_dream_seeds(req: DreamSeedRecallRequest,
         "candidate_count": len(allowed),
         "char_count": used_chars,
         "selection": "deterministic_seeded_stable_memory",
+        "governance_pool": governance_pool,
+        "reinforcement_eligible": reinforcement_eligible,
         "touch": False,
         "apply_dream_accessibility": False,
         "retrieval": {
