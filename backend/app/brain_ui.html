@@ -100,6 +100,18 @@
       <div class="hint">💡 智能检索会理解你的意思，并顺着知识网络找到相关的记忆——不只是关键词匹配。</div>
       <div id="themes" class="hint" style="margin-top:10px"></div>
     </div>
+    <div id="resultTools" class="card" style="display:none">
+      <div class="row2">
+        <input id="resultFilter" placeholder="在当前结果中找关键词，不重新检索" oninput="renderSearchResults()">
+        <select id="resultKind" onchange="renderSearchResults()">
+          <option value="">全部类型</option><option value="semantic">知识/事实</option>
+          <option value="episodic">经历/决策</option><option value="procedural">流程/方法</option>
+          <option value="unknown">未标注类型</option>
+        </select>
+      </div>
+      <button class="ghost" style="margin-top:10px" onclick="copySelectedResults()">复制选中摘要为 Markdown</button>
+      <span id="copyResultMessage" class="hint"></span>
+    </div>
     <div id="results"><div class="empty">输入问题开始检索，或点上面的主题快速进入 👆</div></div>
   </div>
 
@@ -205,10 +217,22 @@ async function doSearch(){
       items=d.items;extra=d.semantic?`（语义理解已开，关联扩散触达 ${d.ppr_reached} 条）`:'';}
     else{const d=await api('/memory/recall?query='+enc(q)+'&k=8&fts=1');
       items=(d.items||[]).map(it=>({id:it.id,title:(it.content||'').split('\n')[0].slice(0,40),
-        snippet:(it.content||'').slice(0,90),importance:it.importance,via:'字面',_full:it.content}));}
-    if(!items.length){$('#results').innerHTML='<div class="empty">没有找到相关记忆。换个说法，或先去"记一条"。</div>';return;}
-    $('#results').innerHTML=`<div class="hint" style="margin:0 0 8px">找到 ${items.length} 条 ${extra}</div>`+
-      items.map((it,i)=>`<div class="res">
+        snippet:(it.content||'').slice(0,90),kind:it.kind,importance:it.importance,via:'字面',_full:it.content}));}
+    window._items=items;window._searchExtra=extra;window._selectedResults=new Set();
+    $('#resultTools').style.display=items.length?'block':'none';
+    $('#copyResultMessage').textContent='';
+    renderSearchResults();
+  }catch(e){$('#results').innerHTML='<div class="empty">检索失败：'+e.message+'</div>';}
+}
+function renderSearchResults(){
+    const items=window._items||[], needle=$('#resultFilter').value.trim().toLowerCase(), kind=$('#resultKind').value;
+    const visible=items.map((it,i)=>({it,i})).filter(({it})=>(!kind||(it.kind||'unknown')===kind)&&
+      (!needle||[it.title,it.snippet,it.source,it._full].filter(Boolean).join(' ').toLowerCase().includes(needle)));
+    if(!visible.length){$('#results').innerHTML='<div class="empty">当前条件没有结果。可清空筛选或换个问题。</div>';return;}
+    $('#results').innerHTML=`<div class="hint" style="margin:0 0 8px">显示 ${visible.length} / ${items.length} 条 ${window._searchExtra||''}</div>`+
+      visible.map(({it,i})=>`<div class="res">
+        <label class="hint"><input type="checkbox" style="width:auto" ${window._selectedResults.has(i)?'checked':''}
+          onchange="this.checked?window._selectedResults.add(${i}):window._selectedResults.delete(${i})"> 加入摘录</label>
         <div class="t">${esc(it.title||'')}</div>
         <div class="s">${esc(it.snippet||'')}</div>
         ${it.source?`<div class="hint" style="margin-top:4px">📖 出处：${esc(it.source)}</div>`:''}
@@ -217,8 +241,13 @@ async function doSearch(){
           ${it.token_count?`<span class="b tok">~${it.token_count} tok</span>`:''}
           <button class="ghost" onclick="showFull(${i},'${it.id}')">看全文</button></div>
         <div class="full" id="full-${i}">${it._full?esc(it._full):''}</div></div>`).join('');
-    window._items=items;
-  }catch(e){$('#results').innerHTML='<div class="empty">检索失败：'+e.message+'</div>';}
+}
+async function copySelectedResults(){
+    const selected=[...(window._selectedResults||[])].sort((a,b)=>a-b).map(i=>window._items[i]);
+    if(!selected.length){$('#copyResultMessage').textContent='先勾选要带走的结果。';return;}
+    const text=['# 记忆检索摘录',...selected.map(it=>`## ${it.title||'记忆'}\n\n${it.snippet||''}${it.source?'\n\n出处：'+it.source:''}\n\n记忆 ID：${it.id}`)].join('\n\n');
+    try{await navigator.clipboard.writeText(text);$('#copyResultMessage').textContent=`已复制 ${selected.length} 条摘要。`}
+    catch(e){$('#copyResultMessage').textContent='浏览器未允许复制；可展开结果手动选取。'}
 }
 async function showFull(i,id){
   const el=$('#full-'+i);if(el.style.display==='block'){el.style.display='none';return;}
